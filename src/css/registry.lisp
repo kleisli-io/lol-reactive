@@ -176,7 +176,15 @@
      (\".btn\" ((\"padding\" . \"1rem\")))
      (\".btn:hover\" ((\"opacity\" . \"0.8\"))))"
   (let ((rule-forms (mapcar (lambda (rule)
-                              `(cons ,(first rule) ',(second rule)))
+                              (let ((sel (first rule)))
+                                (if (and (stringp sel)
+                                         (plusp (length sel))
+                                         (char= (char sel 0) #\@)
+                                         (not (search "@keyframes" sel)))
+                                    ;; @media / @supports: selector + inner rules
+                                    `(cons ,sel ',(rest rule))
+                                    ;; Regular rule or @keyframes: selector + properties alist
+                                    `(cons ,sel ',(second rule)))))
                             rules)))
     `(eval-when (:compile-toplevel :load-toplevel :execute)
        (make-css-module ,name ,@rule-forms))))

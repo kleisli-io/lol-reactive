@@ -1,18 +1,14 @@
 ;;;; -*- Mode: LISP; Syntax: COMMON-LISP; Package: LOL-REACTIVE; Base: 10 -*-
-;;;; HTML generation layer using cl-who
+;;;; HTML page template using cl-who
 ;;;;
 ;;;; GENERIC INFRASTRUCTURE - NO hardcoded colors, fonts, or theme styles.
 ;;;; Apps provide their own visual identity by setting *colors*, *typography*, etc.
+;;;;
+;;;; Shared macros (htm, htm-str), component rendering (render-component,
+;;;; component->html), highlight-sexp, and cl-who config live in html/elements.lisp.
+;;;; This file provides only the full-page template and client-side runtime.
 
 (in-package :lol-reactive)
-
-;;; ============================================================================
-;;; CL-WHO CONFIGURATION
-;;; ============================================================================
-
-;; Use HTML5 mode
-(setf cl-who:*attribute-quote-char* #\"
-      cl-who:*html-empty-tag-aware-p* t)
 
 ;;; ============================================================================
 ;;; PAGE TEMPLATE (GENERIC)
@@ -75,6 +71,16 @@
          (cl-who:htm
           (:style (cl-who:str (htmx-indicator-css)))))
 
+       ;; CSRF meta tag for HTMX runtime (reads token from session if available)
+       (when include-htmx
+         (handler-case
+             (let ((token (get-csrf-token)))
+               (when token
+                 (cl-who:htm
+                  (:meta :name "csrf-token" :content token))))
+           ;; No session available (e.g., no session middleware) — skip
+           (error () nil)))
+
        ;; App-provided head content
        (cl-who:str (or head-extra "")))
 
@@ -95,38 +101,6 @@
           (cl-who:htm
            (:style (cl-who:str (surgery-css)))
            (:script (cl-who:str (surgery-runtime-js)))))))))
-
-;;; ============================================================================
-;;; CL-WHO SHORTHAND MACROS
-;;; ============================================================================
-
-(defmacro htm (&body body)
-  "Shorthand for cl-who output to *standard-output*."
-  `(cl-who:with-html-output (*standard-output*) ,@body))
-
-(defmacro htm-str (&body body)
-  "Generate HTML and return as string."
-  `(cl-who:with-html-output-to-string (s) ,@body))
-
-;;; ============================================================================
-;;; COMPONENT RENDERING
-;;; ============================================================================
-
-(defun render-component (component)
-  "Render a component to HTML string."
-  (funcall component :render))
-
-(defun component->html (component &key (wrapper t))
-  "Convert a component to HTML, optionally wrapping in a container."
-  (let ((html (render-component component))
-        (id (funcall component :id)))
-    (if wrapper
-        (cl-who:with-html-output-to-string (s)
-          (:div :id id
-                :class "component-wrapper"
-                :data-component-id id
-            (cl-who:str html)))
-        html)))
 
 ;;; ============================================================================
 ;;; REACTIVE RUNTIME (Parenscript)
@@ -189,26 +163,3 @@
         (ps:chain (ps:getprop *lol-reactive* "set-state") (bind *lol-reactive*))))
 
     (ps:chain console (log "(LOL-REACTIVE :status :loaded)"))))
-
-;;; ============================================================================
-;;; S-EXPRESSION HIGHLIGHTING (generic utility)
-;;; ============================================================================
-
-(defun highlight-sexp (form)
-  "Convert a Lisp form to syntax-highlighted HTML.
-   Uses CSS classes that apps can style as needed."
-  (let ((str (prin1-to-string form)))
-    ;; Simple highlighting - keywords, strings, numbers
-    (setf str (cl-ppcre:regex-replace-all
-               ":(\\w+)"
-               str
-               "<span class=\"sexp-keyword\">:\\1</span>"))
-    (setf str (cl-ppcre:regex-replace-all
-               "\"([^\"]*)\""
-               str
-               "<span class=\"sexp-string\">\"\\1\"</span>"))
-    (setf str (cl-ppcre:regex-replace-all
-               "\\b(\\d+)\\b"
-               str
-               "<span class=\"sexp-number\">\\1</span>"))
-    str))

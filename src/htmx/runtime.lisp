@@ -118,9 +118,20 @@
                                          "HX-Target" (or (and target (ps:@ target id)) "")
                                          "HX-Current-URL" (ps:@ window location href)))
                                ;; Form serialization: find form element
-                               (form (if (= (ps:chain (ps:@ element tag-name) (to-lower-case)) "form")
-                                         element
-                                         (ps:chain element (closest "form"))))
+                               ;; hx-include: pull values from another element/form
+                               (include-selector (ps:chain element (get-attribute "hx-include")))
+                               (include-el (when include-selector
+                                             (ps:chain document (query-selector include-selector))))
+                               (form (cond
+                                       ;; If hx-include points to a form, use that
+                                       ((and include-el
+                                             (= (ps:chain (ps:@ include-el tag-name) (to-lower-case)) "form"))
+                                        include-el)
+                                       ;; Element is itself a form
+                                       ((= (ps:chain (ps:@ element tag-name) (to-lower-case)) "form")
+                                        element)
+                                       ;; Nearest ancestor form
+                                       (t (ps:chain element (closest "form")))))
                                ;; For GET: append element values as query parameters
                                (get-url (when (= method "GET")
                                           (if (= (ps:chain (ps:@ element tag-name) (to-lower-case)) "form")
@@ -140,9 +151,26 @@
                                                        (encode-u-r-i-component input-name) "="
                                                        (encode-u-r-i-component input-value))
                                                     url)))))
-                               ;; Create FormData for POST/PUT/DELETE when we have a form
-                               (body (when (and form (not (= method "GET")))
-                                       (ps:new (-Form-Data form))))
+                               ;; Create FormData for POST/PUT/DELETE
+                               (body (when (not (= method "GET"))
+                                       (let ((fd (if form
+                                                     (ps:new (-Form-Data form))
+                                                     ;; Standalone input: include own name=value
+                                                     (let ((input-name (ps:chain element (get-attribute "name")))
+                                                           (input-value (ps:@ element value)))
+                                                       (when (and input-name input-value)
+                                                         (let ((fd (ps:new (-Form-Data))))
+                                                           (ps:chain fd (append input-name input-value))
+                                                           fd))))))
+                                         ;; Append CSRF token from meta tag (if present)
+                                         (when fd
+                                           (let ((csrf-meta (ps:chain document
+                                                              (query-selector "meta[name=csrf-token]"))))
+                                             (when csrf-meta
+                                               (let ((token (ps:chain csrf-meta (get-attribute "content"))))
+                                                 (when token
+                                                   (ps:chain fd (append "csrf-token" token)))))))
+                                         fd)))
                                ;; hx-sync support: parse "this:replace" or "this:drop" etc.
                                (sync-attr (ps:chain element (get-attribute "hx-sync")))
                                (sync-strategy (when sync-attr
@@ -382,11 +410,13 @@
                                      :delay nil
                                      :throttle nil
                                      :changed nil
-                                     :once nil)))
+                                     :once nil
+                                     :from nil)))
                           (when (> (ps:@ parts length) 0)
                             (let ((first-part (aref parts 0)))
                               (if (or (ps:chain first-part (starts-with "delay:"))
                                       (ps:chain first-part (starts-with "throttle:"))
+                                      (ps:chain first-part (starts-with "from:"))
                                       (= first-part "changed")
                                       (= first-part "once"))
                                   (setf (ps:@ spec event) "click")
@@ -402,6 +432,9 @@
                                                 (setf (ps:@ spec throttle)
                                                       ((ps:@ *htmx* parse-interval)
                                                        (ps:chain part (substring 9)))))
+                                               ((ps:chain part (starts-with "from:"))
+                                                (setf (ps:@ spec from)
+                                                      (ps:chain part (substring 5))))
                                                ((= part "changed")
                                                 (setf (ps:@ spec changed) t))
                                                ((= part "once")
@@ -409,7 +442,14 @@
                           spec))
 
        "addTriggerHandler" (lambda (element trigger-spec handler)
-                              (let ((event-name (ps:@ trigger-spec event)))
+                              (let ((event-name (ps:@ trigger-spec event))
+                                    ;; from: modifier — listen on a different element
+                                    (listen-on (if (ps:@ trigger-spec from)
+                                                   (ps:chain document
+                                                     (query-selector (ps:@ trigger-spec from)))
+                                                   element)))
+                                (unless listen-on
+                                  (setf listen-on element))
                                 (cond
                                   ;; IntersectionObserver triggers: revealed, intersect
                                   ((or (= event-name "revealed")
@@ -437,7 +477,7 @@
                                          (last-value nil)
                                          (throttled nil)
                                          (fired nil))
-                                     (ps:chain element
+                                     (ps:chain listen-on
                                                (add-event-listener
                                                 event-name
                                                 (lambda (event)
@@ -728,596 +768,3 @@
   (format nil "~@[hx-delete=\"~a\"~]~@[ hx-target=\"~a\"~]~@[ hx-swap=\"~a\"~]~@[ hx-trigger=\"~a\"~]"
           url target swap trigger))
 
-;;; ============================================================================
-;;; OOB RESPONSE HELPERS
-;;; ============================================================================
-
-(defun find-tag-end (html)
-  "Find the position of > that ends the opening tag, skipping > inside quotes.
-   Returns the position of the closing > or NIL if not found."
-  (let ((in-quote nil)
-        (len (length html)))
-    (loop for i from 0 below len
-          for char = (char html i)
-          do (cond
-               ((char= char #\")
-                (setf in-quote (not in-quote)))
-               ((and (char= char #\>) (not in-quote))
-                (return i)))
-          finally (return nil))))
-
-(defun content-starts-with-id-p (html target-id)
-  "Check if HTML starts with an element that has the specified ID.
-   Returns T if the first element's opening tag contains id=\"TARGET-ID\".
-   Correctly handles > characters inside quoted attribute values."
-  (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) html)))
-    (when (and (> (length trimmed) 0)
-               (char= (char trimmed 0) #\<))
-      ;; Find end of opening tag (skip > inside quotes)
-      (let ((tag-end (find-tag-end trimmed)))
-        (when tag-end
-          ;; Look for id="target-id" within the opening tag
-          (let ((tag-content (subseq trimmed 0 tag-end))
-                (id-pattern (format nil "id=\"~a\"" target-id)))
-            (search id-pattern tag-content :test #'char-equal)))))))
-
-(defun inject-oob-attribute (html swap-value)
-  "Inject hx-swap-oob attribute into the first element's opening tag.
-   Handles both regular tags and self-closing tags (e.g., <input />).
-   Correctly handles > characters inside quoted attribute values.
-   Returns the modified HTML string."
-  (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) html)))
-    (let ((first-gt (find-tag-end trimmed)))
-      (if first-gt
-          ;; Check for self-closing tag: look for / before >
-          (let* ((before-gt (subseq trimmed 0 first-gt))
-                 (slash-pos (position #\/ before-gt :from-end t))
-                 ;; Is it a self-closing tag? (/ appears near end, only whitespace between / and >)
-                 (self-closing-p (and slash-pos
-                                      (every (lambda (c) (member c '(#\Space #\Tab)))
-                                             (subseq before-gt (1+ slash-pos)))))
-                 ;; Insert position: before the / for self-closing, before > otherwise
-                 (insert-pos (if self-closing-p slash-pos first-gt)))
-            (concatenate 'string
-                         (subseq trimmed 0 insert-pos)
-                         (format nil " hx-swap-oob=\"~a\"" swap-value)
-                         (subseq trimmed insert-pos)))
-          ;; Fallback if no > found (shouldn't happen with valid HTML)
-          html))))
-
-(defun oob-swap (id content &key (swap "true"))
-  "Generate an OOB swap element.
-   SWAP can be: true (outerHTML), innerHTML, beforebegin, afterbegin, etc.
-
-   Smart behavior for outerHTML swaps: if content already contains an element
-   with the target ID, injects hx-swap-oob attribute directly instead of
-   wrapping (which would create duplicate IDs)."
-  (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) content)))
-    (if (and (string= swap "outerHTML")
-             (content-starts-with-id-p trimmed id))
-        ;; Content already has the ID - inject attribute directly
-        (inject-oob-attribute trimmed swap)
-        ;; Standard wrapping for innerHTML, other strategies, or content without ID
-        (cl-who:with-html-output-to-string (s)
-          (:div :id id :hx-swap-oob swap
-                (cl-who:str content))))))
-
-(defmacro with-oob-swaps ((&rest swaps) &body body)
-  "Execute BODY and append OOB swap elements.
-   SWAPS is a list of (id content &key swap) specifications."
-  `(concatenate 'string
-                (progn ,@body)
-                ,@(mapcar (lambda (swap-spec)
-                            `(oob-swap ,@swap-spec))
-                          swaps)))
-
-(defun oob-content (id content)
-  "Generate an OOB innerHTML swap that preserves target element attributes.
-
-   Unlike oob-swap which replaces the entire element (including class, hx-*, etc),
-   this only replaces the innerHTML of the target element, preserving all attributes.
-
-   Use this when the target element has attributes you want to keep, such as:
-   - CSS classes for styling
-   - hx-trigger for polling
-   - data-* attributes
-
-   Example:
-     ;; Target: <div id=\"counter\" class=\"big\" hx-trigger=\"every 1s\">0</div>
-     (oob-content \"counter\" \"42\")
-     ;; Result: <span style=\"display:none\" hx-swap-oob=\"innerHTML:#counter\">42</span>
-     ;; Target becomes: <div id=\"counter\" class=\"big\" hx-trigger=\"every 1s\">42</div>"
-  (htm-str
-    (:span :style "display:none" :hx-swap-oob (format nil "innerHTML:#~A" id)
-      (cl-who:str content))))
-
-;;; ============================================================================
-;;; HTMX CSS
-;;; ============================================================================
-
-(defun htmx-indicator-css ()
-  "Generate CSS for HTMX request indicators using lol-reactive CSS utilities."
-  (concatenate 'string
-               "/* HTMX Request Indicator Styles */"
-               (css-rules ".htmx-request"
-                          :opacity "0.7"
-                          :cursor "wait")
-               (css-rules ".htmx-request.htmx-indicator"
-                          :opacity "1")
-               (css-rules ".htmx-indicator"
-                          :display "none")
-               (css-rules ".htmx-request .htmx-indicator, .htmx-request.htmx-indicator"
-                          :display "inline-block")))
-
-;;; ============================================================================
-;;; AUTOCOMPLETE SUPPORT
-;;; ============================================================================
-
-(defun render-autocomplete (&key id endpoint
-                                 (placeholder "Search...")
-                                 (debounce 300)
-                                 (min-chars 1)
-                                 class)
-  "Render a search input with autocomplete behavior.
-
-   ID: Unique identifier for this autocomplete (required)
-   ENDPOINT: Server endpoint to fetch results from (required)
-   PLACEHOLDER: Input placeholder text
-   DEBOUNCE: Milliseconds to wait before firing request (default 300)
-   MIN-CHARS: Minimum characters before searching (default 1, reserved for future use)
-   CLASS: Additional CSS classes for the container"
-  (declare (ignore min-chars)) ; Reserved for future use
-  (htm-str
-    (:div :class (format nil "autocomplete-container~@[ ~a~]" class)
-      (:input :type "search"
-              :id id
-              :name "q"
-              :placeholder placeholder
-              :autocomplete "off"
-              :hx-get endpoint
-              :hx-trigger (format nil "input changed delay:~ams" debounce)
-              :hx-target (format nil "#~a-results" id)
-              :hx-sync "this:replace"
-              :hx-indicator (format nil "#~a-loading" id)
-              :role "combobox"
-              :aria-controls (format nil "~a-results" id)
-              :aria-expanded "false"
-              :aria-autocomplete "list")
-      (:span :id (format nil "~a-loading" id)
-             :class "htmx-indicator autocomplete-loading"
-             "Searching...")
-      (:div :id (format nil "~a-results" id)
-            :role "listbox"
-            :class "autocomplete-results"
-            :aria-label "Search results"))))
-
-(defun render-autocomplete-results (items &key id render-item (empty-message "No results found"))
-  "Render search results for autocomplete.
-
-   ITEMS: List of items to render
-   ID: Autocomplete ID (must match render-autocomplete)
-   RENDER-ITEM: Function to render each item (default: identity)
-   EMPTY-MESSAGE: Message to show when no results"
-  (let ((render-fn (or render-item #'identity)))
-    (htm-str
-      (if items
-          (cl-who:htm
-            (:ul :id (format nil "~a-results" id)
-                 :role "listbox"
-                 :class "autocomplete-results"
-              (loop for item in items
-                    for i from 0
-                    do (cl-who:htm
-                        (:li :role "option"
-                             :id (format nil "~a-option-~a" id i)
-                             :class "autocomplete-result"
-                             :tabindex "-1"
-                             :aria-selected "false"
-                             (cl-who:str (funcall render-fn item)))))))
-          (cl-who:htm
-            (:div :id (format nil "~a-results" id)
-                  :role "listbox"
-                  :class "autocomplete-results autocomplete-empty"
-              (:span :class "autocomplete-no-results"
-                     (cl-who:str empty-message))))))))
-
-(defun autocomplete-css ()
-  "CSS for autocomplete component using design system tokens.
-   Uses CSS variables for theming support."
-  (concatenate 'string
-    "/* Autocomplete Component Styles */"
-    (css-rules ".autocomplete-container"
-               "position" "relative")
-    (css-rules ".autocomplete-results"
-               "position" "absolute"
-               "width" "100%"
-               "max-height" "300px"
-               "overflow-y" "auto"
-               "background" (css-var "color-surface")
-               "border" (format nil "~a solid ~a"
-                                (css-var "effect-border-thin")
-                                (css-var "color-muted"))
-               "border-radius" (css-var "space-1")
-               "box-shadow" (css-var "effect-shadow-md")
-               "z-index" (css-var "effect-z-modal")
-               "margin" "0"
-               "padding" "0")
-    (css-rules ".autocomplete-results:empty"
-               "display" "none")
-    (css-rules ".autocomplete-result"
-               "padding" (format nil "~a ~a"
-                                 (css-var "space-2")
-                                 (css-var "space-3"))
-               "cursor" "pointer"
-               "list-style" "none"
-               "color" (css-var "color-text")
-               "transition" (css-var "effect-transition-fast"))
-    (css-rules ".autocomplete-result:hover, .autocomplete-result.selected"
-               "background" (css-var "color-surface-alt"))
-    (css-rules ".autocomplete-result.selected"
-               "outline" (format nil "2px solid ~a" (css-var "color-primary"))
-               "outline-offset" "-2px")
-    (css-rules ".autocomplete-loading"
-               "display" "none"
-               "position" "absolute"
-               "right" (css-var "space-2")
-               "top" "50%"
-               "transform" "translateY(-50%)"
-               "color" (css-var "color-muted")
-               "font-size" (css-var "font-small"))
-    (css-rules ".htmx-request .autocomplete-loading"
-               "display" "inline")
-    (css-rules ".autocomplete-no-results"
-               "display" "block"
-               "padding" (css-var "space-3")
-               "color" (css-var "color-muted")
-               "font-style" "italic")
-    (css-rules ".autocomplete-empty"
-               "border" "none"
-               "box-shadow" "none")))
-
-;;; ============================================================================
-;;; WEBSOCKET CLIENT RUNTIME (Parenscript)
-;;; ============================================================================
-
-(defun ws-client-js ()
-  "Generate WebSocket client runtime via Parenscript.
-   Handles connection management, reconnection, and message processing."
-  (parenscript:ps
-    ;; WebSocket Manager Object
-    (defvar *ws-manager*
-      (ps:create
-       "connections" (ps:create)  ; channel -> WebSocket
-       "reconnectDelay" 1000
-       "maxReconnectDelay" 30000
-
-       ;; Connect to a WebSocket channel
-       "connect" (lambda (channel &optional options)
-                   (let* ((protocol (if (= (ps:@ window location protocol) "https:") "wss:" "ws:"))
-                          (url (+ protocol "//" (ps:@ window location host) "/ws/" channel))
-                          (ws (ps:new (-Web-Socket url)))
-                          (reconnect-delay (ps:@ *ws-manager* reconnect-delay))
-                          ;; Support both kebab-case ('on-open') and camelCase (onOpen) keys
-                          (on-message (and options (or (ps:getprop options "on-message")
-                                                       (ps:@ options on-message))))
-                          (on-open (and options (or (ps:getprop options "on-open")
-                                                    (ps:@ options on-open))))
-                          (on-close (and options (or (ps:getprop options "on-close")
-                                                     (ps:@ options on-close)))))
-
-                     ;; Store connection
-                     (setf (ps:getprop (ps:@ *ws-manager* connections) channel) ws)
-
-                     ;; Handle connection open
-                     (setf (ps:@ ws onopen)
-                           (lambda ()
-                             (ps:chain console (log "WebSocket connected:" channel))
-                             (setf reconnect-delay (ps:@ *ws-manager* reconnect-delay))
-                             (when on-open
-                               (funcall on-open ws))))
-
-                     ;; Handle incoming messages
-                     (setf (ps:@ ws onmessage)
-                           (lambda (event)
-                             (let ((data (ps:chain -j-s-o-n (parse (ps:@ event data)))))
-                               ;; Process based on message type
-                               (let ((msg-type (ps:@ data type)))
-                                 (cond
-                                   ;; HTML swap
-                                   ((= msg-type "html")
-                                    ((ps:@ *ws-manager* handle-html-update) data))
-                                   ;; OOB updates
-                                   ((= msg-type "oob")
-                                    ((ps:@ *ws-manager* handle-oob-updates) data))
-                                   ;; Event trigger
-                                   ((= msg-type "trigger")
-                                    ((ps:@ *ws-manager* handle-trigger) data))
-                                   ;; Custom handler
-                                   (t
-                                    (when on-message
-                                      (funcall on-message data ws))))))))
-
-                     ;; Handle connection close with reconnection
-                     (setf (ps:@ ws onclose)
-                           (lambda (event)
-                             (ps:chain console (log "WebSocket closed:" channel "- reconnecting in" reconnect-delay "ms"))
-                             (when on-close
-                               (funcall on-close event ws))
-                             ;; Attempt reconnection with exponential backoff
-                             (set-timeout
-                              (lambda ()
-                                ((ps:@ *ws-manager* connect) channel options))
-                              reconnect-delay)
-                             ;; Increase delay for next attempt (with max)
-                             (setf reconnect-delay
-                                   (ps:chain -math (min (* reconnect-delay 2)
-                                                        (ps:@ *ws-manager* max-reconnect-delay))))))
-
-                     ;; Handle errors
-                     (setf (ps:@ ws onerror)
-                           (lambda (error)
-                             (ps:chain console (error "WebSocket error:" channel error))))
-
-                     ;; Handle race condition: if connection opened before handlers were set
-                     (when (and on-open (= (ps:@ ws ready-state) 1))
-                       (ps:chain console (log "WebSocket already connected:" channel))
-                       (funcall on-open ws))
-
-                     ws))
-
-       ;; Disconnect from a channel
-       "disconnect" (lambda (channel)
-                      (let ((ws (ps:getprop (ps:@ *ws-manager* connections) channel)))
-                        (when ws
-                          (ps:chain ws (close))
-                          (delete (ps:getprop (ps:@ *ws-manager* connections) channel)))))
-
-       ;; Send message to a channel
-       "send" (lambda (channel data)
-                (let ((ws (ps:getprop (ps:@ *ws-manager* connections) channel)))
-                  (when (and ws (= (ps:@ ws ready-state) 1))
-                    (ps:chain ws (send (if (stringp data)
-                                           data
-                                           (ps:chain -j-s-o-n (stringify data))))))))
-
-       ;; Handle HTML update message
-       "handleHtmlUpdate" (lambda (data)
-                            (let ((target (ps:chain document (get-element-by-id (ps:@ data target)))))
-                              (when target
-                                (let ((swap (or (ps:@ data swap) "innerHTML")))
-                                  ((ps:@ *htmx* swap) target (ps:@ data html) swap)
-                                  ;; Re-initialize HTMX on updated content
-                                  ((ps:@ *htmx* process-element) target)))))
-
-       ;; Handle OOB updates message
-       "handleOobUpdates" (lambda (data)
-                            (ps:chain (ps:@ data updates) (for-each
-                              (lambda (update)
-                                (let ((target (ps:chain document (get-element-by-id (ps:@ update target)))))
-                                  (when target
-                                    (let ((swap (or (ps:@ update swap) "outerHTML")))
-                                      ((ps:@ *htmx* swap) target (ps:@ update html) swap)
-                                      ;; Re-process the element
-                                      (let ((new-el (ps:chain document (get-element-by-id (ps:@ update target)))))
-                                        (when new-el
-                                          ((ps:@ *htmx* process-element) new-el))))))))))
-
-       ;; Handle event trigger message
-       "handleTrigger" (lambda (data)
-                         (let ((event (ps:new (-Custom-Event (ps:@ data event)
-                                                          (ps:create :detail (ps:@ data detail)
-                                                                     :bubbles t)))))
-                           (ps:chain document (dispatch-event event))))))))
-
-;;; ============================================================================
-;;; SSE CLIENT RUNTIME (Parenscript)
-;;; ============================================================================
-
-(defun sse-client-js ()
-  "Generate Server-Sent Events client runtime via Parenscript.
-   Handles EventSource connections and message processing."
-  (parenscript:ps
-    ;; SSE Manager Object
-    (defvar *sse-manager*
-      (ps:create
-       "connections" (ps:create)  ; channel -> EventSource
-       "reconnectDelay" 3000      ; Default retry from SSE spec
-
-       ;; Connect to an SSE channel
-       "connect" (lambda (channel &optional options)
-                   (let* ((url (+ "/sse/" channel))
-                          (source (ps:new (-Event-Source url)))
-                          ;; Support both kebab-case ('on-open') and camelCase (onOpen) keys
-                          (on-message (and options (or (ps:getprop options "on-message")
-                                                       (ps:@ options on-message))))
-                          (on-open (and options (or (ps:getprop options "on-open")
-                                                    (ps:@ options on-open))))
-                          (on-error (and options (or (ps:getprop options "on-error")
-                                                     (ps:@ options on-error)))))
-
-                     ;; Store connection
-                     (setf (ps:getprop (ps:@ *sse-manager* connections) channel) source)
-
-                     ;; Handle connection open
-                     (setf (ps:@ source onopen)
-                           (lambda ()
-                             (ps:chain console (log "SSE connected:" channel))
-                             (when on-open
-                               (funcall on-open source))))
-
-                     ;; Handle 'connected' event (server confirmation)
-                     (ps:chain source (add-event-listener "connected"
-                       (lambda (event)
-                         (ps:chain console (log "SSE confirmed:" channel
-                                                (ps:chain -j-s-o-n (parse (ps:@ event data))))))))
-
-                     ;; Handle 'update' event (HTML updates)
-                     (ps:chain source (add-event-listener "update"
-                       (lambda (event)
-                         (let ((data (ps:chain -j-s-o-n (parse (ps:@ event data)))))
-                           ((ps:@ *sse-manager* handle-html-update) data)))))
-
-                     ;; Handle 'oob' event (out-of-band updates)
-                     (ps:chain source (add-event-listener "oob"
-                       (lambda (event)
-                         (let ((data (ps:chain -j-s-o-n (parse (ps:@ event data)))))
-                           ((ps:@ *sse-manager* handle-oob-updates) data)))))
-
-                     ;; Handle 'trigger' event (custom events)
-                     (ps:chain source (add-event-listener "trigger"
-                       (lambda (event)
-                         (let ((data (ps:chain -j-s-o-n (parse (ps:@ event data)))))
-                           ((ps:@ *sse-manager* handle-trigger) data)))))
-
-                     ;; Handle generic 'message' event (fallback)
-                     (setf (ps:@ source onmessage)
-                           (lambda (event)
-                             (when on-message
-                               (let ((data (ps:chain -j-s-o-n (parse (ps:@ event data)))))
-                                 (funcall on-message data source)))))
-
-                     ;; Handle errors (EventSource auto-reconnects)
-                     (setf (ps:@ source onerror)
-                           (lambda (event)
-                             (ps:chain console (warn "SSE error:" channel event))
-                             (when on-error
-                               (funcall on-error event source))))
-
-                     ;; Handle race condition: if connection opened before handlers were set
-                     (when (and on-open (= (ps:@ source ready-state) 1))
-                       (ps:chain console (log "SSE already connected:" channel))
-                       (funcall on-open source))
-
-                     source))
-
-       ;; Disconnect from a channel
-       "disconnect" (lambda (channel)
-                      (let ((source (ps:getprop (ps:@ *sse-manager* connections) channel)))
-                        (when source
-                          (ps:chain source (close))
-                          (delete (ps:getprop (ps:@ *sse-manager* connections) channel)))))
-
-       ;; Handle HTML update event
-       "handleHtmlUpdate" (lambda (data)
-                            (let ((target (ps:chain document (get-element-by-id (ps:@ data target)))))
-                              (when target
-                                (let ((swap (or (ps:@ data swap) "innerHTML")))
-                                  ((ps:@ *htmx* swap) target (ps:@ data html) swap)
-                                  ;; Re-initialize HTMX on updated content
-                                  ((ps:@ *htmx* process-element) target)))))
-
-       ;; Handle OOB updates event
-       "handleOobUpdates" (lambda (data)
-                            (ps:chain (ps:@ data updates) (for-each
-                              (lambda (update)
-                                (let ((target (ps:chain document (get-element-by-id (ps:@ update target)))))
-                                  (when target
-                                    (let ((swap (or (ps:@ update swap) "outerHTML")))
-                                      ((ps:@ *htmx* swap) target (ps:@ update html) swap)
-                                      ;; Re-process the element
-                                      (let ((new-el (ps:chain document (get-element-by-id (ps:@ update target)))))
-                                        (when new-el
-                                          ((ps:@ *htmx* process-element) new-el))))))))))
-
-       ;; Handle event trigger
-       "handleTrigger" (lambda (data)
-                         (let ((event (ps:new (-Custom-Event (ps:@ data event)
-                                                          (ps:create :detail (ps:@ data detail)
-                                                                     :bubbles t)))))
-                           (ps:chain document (dispatch-event event))))))))
-
-;;; ============================================================================
-;;; OPTIMISTIC UPDATE RUNTIME (Parenscript)
-;;; ============================================================================
-
-(defun optimistic-js ()
-  "Generate optimistic update client code via Parenscript.
-   Provides instant UI feedback before server response with automatic rollback."
-  (parenscript:ps
-    (defvar *optimistic*
-      (ps:create
-       ;; Store original states for rollback
-       "originals" (ps:create)
-
-       ;; Apply optimistic state to element
-       "apply" (lambda (element config)
-                 (let ((id (or (ps:@ element id)
-                               (ps:chain -math (random) (to-string 36) (substr 2 9)))))
-                   ;; Ensure element has ID for tracking
-                   (unless (ps:@ element id)
-                     (setf (ps:@ element id) id))
-                   ;; Save original state
-                   (setf (ps:getprop (ps:@ *optimistic* originals) id)
-                         (ps:create
-                          :text-content (ps:@ element text-content)
-                          :inner-h-t-m-l (ps:@ element inner-h-t-m-l)
-                          :class-name (ps:@ element class-name)
-                          :disabled (ps:@ element disabled)
-                          :value (ps:@ element value)))
-                   ;; Apply optimistic changes
-                   (when (ps:@ config text)
-                     (setf (ps:@ element text-content) (ps:@ config text)))
-                   (when (ps:@ config html)
-                     (setf (ps:@ element inner-h-t-m-l) (ps:@ config html)))
-                   (when (ps:@ config class)
-                     (setf (ps:@ element class-name) (ps:@ config class)))
-                   (when (ps:@ config add-class)
-                     (ps:chain element class-list (add (ps:@ config add-class))))
-                   (when (ps:@ config remove-class)
-                     (ps:chain element class-list (remove (ps:@ config remove-class))))
-                   (when (not (ps:=== undefined (ps:@ config disabled)))
-                     (setf (ps:@ element disabled) (ps:@ config disabled)))
-                   id))
-
-       ;; Rollback to original state
-       "rollback" (lambda (element-or-id)
-                    (let* ((id (if (stringp element-or-id)
-                                   element-or-id
-                                   (ps:@ element-or-id id)))
-                           (element (if (stringp element-or-id)
-                                        (ps:chain document (get-element-by-id element-or-id))
-                                        element-or-id))
-                           (original (ps:getprop (ps:@ *optimistic* originals) id)))
-                      (when (and element original)
-                        (setf (ps:@ element text-content) (ps:@ original text-content))
-                        (setf (ps:@ element inner-h-t-m-l) (ps:@ original inner-h-t-m-l))
-                        (setf (ps:@ element class-name) (ps:@ original class-name))
-                        (setf (ps:@ element disabled) (ps:@ original disabled))
-                        (when (ps:@ original value)
-                          (setf (ps:@ element value) (ps:@ original value)))
-                        ;; Clean up stored state
-                        (delete (ps:getprop (ps:@ *optimistic* originals) id)))))
-
-       ;; Confirm optimistic change (clear stored original)
-       "confirm" (lambda (element-or-id)
-                   (let ((id (if (stringp element-or-id)
-                                 element-or-id
-                                 (ps:@ element-or-id id))))
-                     (delete (ps:getprop (ps:@ *optimistic* originals) id))))
-
-       ;; Wrap HTMX request with optimistic update
-       "wrap" (lambda (element config)
-                (let ((id ((ps:@ *optimistic* apply) element config)))
-                  ;; Listen for HTMX events to confirm or rollback
-                  (ps:chain element (add-event-listener "htmx:afterRequest"
-                    (lambda (event)
-                      (if (ps:@ event detail successful)
-                          ((ps:@ *optimistic* confirm) id)
-                          ((ps:@ *optimistic* rollback) id)))
-                    (ps:create :once t)))))))))
-
-;;; ============================================================================
-;;; COMBINED RUNTIME
-;;; ============================================================================
-
-(defun lol-reactive-runtime-js ()
-  "Generate the complete lol-reactive client runtime.
-   Includes HTMX runtime, WebSocket client, SSE client, and optimistic updates."
-  (concatenate 'string
-               (htmx-runtime-js)
-               ";"
-               (ws-client-js)
-               ";"
-               (sse-client-js)
-               ";"
-               (optimistic-js)))

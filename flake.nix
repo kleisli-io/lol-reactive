@@ -45,69 +45,81 @@
 
             srcs = map (f: ./. + "/${f}") [
               # Package definition
-              "package.lisp"
+              "src/package.lisp"
 
               # CSS infrastructure
-              "css/registry.lisp"
-              "css/tokens.lisp"
-              "css/generation.lisp"
-              "css/tailwind.lisp"
+              "src/css/registry.lisp"
+              "src/css/tokens.lisp"
+              "src/css/generation.lisp"
+              "src/css/tailwind.lisp"
 
               # Core reactive primitives
-              "components.lisp"
-              "signals.lisp"
+              "src/core/components.lisp"
+              "src/core/signals.lisp"
+              "src/core/state.lisp"
+              "src/core/collections.lisp"
 
-              # HTML generation
-              "html.lisp"
-              "html/elements.lisp"
-              "html/escape.lisp"
+              # HTML generation (elements first — defines htm, htm-str, etc.)
+              "src/html/elements.lisp"
+              "src/html/page.lisp"
+              "src/html/escape.lisp"
 
-              # Parenscript utilities
-              "parenscript-utils.lisp"
+              # Client-side utilities
+              "src/client/parenscript.lisp"
 
-              # HTMX-style runtime
-              "htmx/runtime.lisp"
-              "htmx/server.lisp"
-              "htmx/morph.lisp"
+              # HTMX runtime + extensions
+              "src/htmx/runtime.lisp"
+              "src/htmx/oob.lisp"
+              "src/htmx/autocomplete.lisp"
+              "src/htmx/server.lisp"
+              "src/htmx/morph.lisp"
 
               # Server infrastructure (Clack-based)
-              "server/clack.lisp"
-              "server/security.lisp"
-              "server/errors.lisp"
-              "server/app.lisp"
-              "server/routes.lisp"
+              "src/server/clack.lisp"
+              "src/server/security.lisp"
+              "src/server/errors.lisp"
+              "src/server/app.lisp"
+              "src/server/routes.lisp"
 
               # Composition (props, context, children)
-              "composition/props.lisp"
-              "composition/context.lisp"
-              "composition/children.lisp"
+              "src/composition/props.lisp"
+              "src/composition/context.lisp"
+              "src/composition/children.lisp"
 
               # Forms and async
-              "forms/form-dsl.lisp"
-              "async/resources.lisp"
+              "src/forms/form-dsl.lisp"
+              "src/async/resources.lisp"
 
               # Advanced features
-              "advanced/wizards.lisp"
+              "src/advanced/wizards.lisp"
 
-              # Real-time features (WebSocket + SSE support)
-              "realtime/websocket.lisp"
-              "realtime/sse.lisp"
+              # Real-time features (server-side WebSocket + SSE)
+              "src/realtime/websocket.lisp"
+              "src/realtime/sse.lisp"
+
+              # Real-time client runtimes (Parenscript)
+              "src/realtime/ws-client.lisp"
+              "src/realtime/sse-client.lisp"
+              "src/realtime/optimistic.lisp"
 
               # Development tools
-              "surgery.lisp"
-              "surgery-js.lisp"
+              "src/devtools/surgery.lisp"
+              "src/devtools/surgery-js.lisp"
 
               # Rendering infrastructure
-              "rendering/dom-diff.lisp"
-              "rendering/keyed-list.lisp"
+              "src/rendering/dom-diff.lisp"
+              "src/rendering/keyed-list.lisp"
 
               # Fullstack (isomorphic components)
-              "fullstack/component-api.lisp"
-              "fullstack/isomorphic.lisp"
+              "src/fullstack/component-api.lisp"
+              "src/fullstack/isomorphic.lisp"
 
               # Optimization (compile-time analysis)
-              "optimization/reactive-analysis.lisp"
-              "optimization/template-validation.lisp"
+              "src/optimization/reactive-analysis.lisp"
+              "src/optimization/template-validation.lisp"
+
+              # Combined client runtime (must be last — aggregates all JS)
+              "src/client/runtime.lisp"
             ];
 
             # FiveAM test suite - build fails if tests don't pass
