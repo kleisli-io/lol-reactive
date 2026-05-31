@@ -109,6 +109,7 @@
   :components ((:file "src/packages/html")
                (:file "src/html/elements")
                (:file "src/html/page")
+               (:file "src/html/csp-conformance")
                (:file "src/html/escape")))
 (defsystem "lol-web/server"
   :depends-on ("lol-web/escape"
@@ -142,6 +143,7 @@
                (:file "src/server/security")
                (:file "src/server/http-errors")
                (:file "src/server/errors")
+               (:file "src/server/assets")
                (:file "src/server/app")
                (:file "src/server/streaming-gate")
                (:file "src/server/routes")))
@@ -425,6 +427,8 @@
                (:file "t/server/suite")
                (:file "t/server/server")
                (:file "t/server/regression")
+               (:file "t/server/assets")
+               (:file "t/server/csp-invariant")
                (:file "t/server/http-e2e"))
   :perform (test-op (op c)
              (uiop:symbol-call :lol-web/server/test :run-tests)))
