@@ -7,11 +7,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1779304592,
-        "narHash": "sha256-XV6wD2ShFiNuEpvtgafJPVVpPAfviByq1xmTc79RC5Q=",
+        "lastModified": 1779990845,
+        "narHash": "sha256-/QQwhQOlUc7kgBW8ZiABoYmTnRfbx41EWDf+L4i4tA0=",
         "owner": "kleisli-io",
         "repo": "cl-deps",
-        "rev": "784b8b35c7d3166ef775ef2f8e8711e1e7e69464",
+        "rev": "58b78b4da3955602c461b8258f31df7d7453dd42",
         "type": "github"
       },
       "original": {
