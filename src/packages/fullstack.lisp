@@ -16,14 +16,22 @@
 (defpackage :lol-web/fullstack
   (:use :cl :iterate
         :lol-web/core      ; defcomponent, find-component, register-component
-        :lol-web/html      ; html-page, htm, htm-str, escape-html
+        :lol-web/html      ; html-page, htm, htm-str
         :lol-web/server    ; encode-json-string, decode-json-string
         :lol-web/extractors) ; defhandler, :json-body extractor
   (:import-from :let-over-lambda
                 :pandoriclet
                 :dlambda :defmacro!
                 :symb)
+  ;; escape-html serializes hydration state for attribute embedding;
+  ;; safe-coerce-keyword guards component-api :set-state / :action body keys.
+  (:import-from :lol-web/escape
+                #:escape-html
+                #:safe-coerce-keyword)
   (:export
+   ;; hydration.lisp
+   #:sign-hydration-state
+   #:verify-hydration-state
    ;; isomorphic.lisp
    #:defisomorphic-component
    #:render-isomorphic
@@ -41,4 +49,7 @@
    #:list-api-routes
    #:inspect-api-component
    #:generate-api-client-js
-   #:api-client-script-tag))
+   #:api-client-script-tag
+   #:*action-arities*
+   #:register-action-arity
+   #:action-arity))

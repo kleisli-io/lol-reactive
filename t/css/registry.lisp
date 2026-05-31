@@ -96,9 +96,62 @@
       (is (search "padding: 1rem" css))))
   (clear-css-registry))
 
+(test regression-module-concurrent-add-rule-and-render
+  "Per-module rule mutation is serialized while render reads snapshots."
+  (clear-css-registry)
+  (let* ((mod (lol-web/css::make-css-module
+               :probe-concurrent-rules
+               (cons ".base" '(("color" . "red")))))
+         (n-threads 8)
+         (per-thread 25)
+         (threads
+           (loop for tid from 0 below n-threads
+                 collect (let ((tid tid))
+                           (bordeaux-threads:make-thread
+                            (lambda ()
+                              (dotimes (i per-thread)
+                                (funcall mod :add-rule
+                                         (format nil ".t~D-~D" tid i)
+                                         '(("padding" . "1rem")))
+                                (funcall mod :render))))))))
+    (dolist (th threads) (bordeaux-threads:join-thread th))
+    (let ((inspect (funcall mod :inspect))
+          (css (funcall mod :render)))
+      (is (= (1+ (* n-threads per-thread)) (getf inspect :rule-count))
+          "all concurrent :add-rule calls must be present")
+      (is (search ".base" css))
+      (is (search ".t0-0" css))
+      (is (search ".t7-24" css))))
+  (clear-css-registry))
+
 (test module-unknown-message-errors
   "An unknown message signals an error rather than silently no-op"
   (clear-css-registry)
   (let ((mod (lol-web/css::make-css-module :probe-bad (cons ".x" '(("k" . "v"))))))
     (signals error (funcall mod :totally-unknown-message)))
   (clear-css-registry))
+
+(test regression-media-selector-gated-by-safe-css-selector-p
+  "The module renderer emits the @media block selector raw, so its safety
+   rests on safe-css-selector-p at registration. A well-formed @media
+   selector renders its raw header; a break-out @media string carrying
+   `{`/`}`/`*/` is refused before it can enter the registry — at
+   make-css-module construction and on a live module's :add-rule alike."
+  (clear-css-registry)
+  (unwind-protect
+       (progn
+         (let ((mod (make-css-module
+                     :regression-media-ok
+                     (cons "@media (min-width: 768px)"
+                           (list (list ".x" '(("color" . "red"))))))))
+           (is (search "@media (min-width: 768px) {" (funcall mod :render))
+               "a safe @media selector renders its raw block header"))
+         (signals unsafe-css-selector
+           (make-css-module
+            :regression-media-evil
+            (cons "@media x { } body { background: url(evil) } /*"
+                  (list (list ".x" '(("color" . "red")))))))
+         (let ((mod (make-css-module :regression-media-addrule)))
+           (signals unsafe-css-selector
+             (funcall mod :add-rule "@media x } evil {" '()))))
+    (clear-css-registry)))

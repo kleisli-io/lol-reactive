@@ -471,3 +471,93 @@
                                    :custom-resolver '%test-custom-resolver))
                 :options nil))
     (is (= 1 (lol-web/extractors::%validate-handler-metadata-or-error meta)))))
+
+;;; ============================================================================
+;;; :type :keyword / :type :symbol coercion — bounded keyword pool
+;;; ============================================================================
+
+(test regression-coerce-keyword-bounds-keyword-pool
+  "1000 distinct hostile :type :keyword inputs must not grow the keyword
+   pool. Unknown inputs signal extractor-coercion-error (400); the test
+   catches them so the loop completes."
+  (let ((baseline (length (apropos-list "" :keyword)))
+        (spec (make-extractor-spec :name 'k :kind :query :type 'keyword
+                                   :required-p t :source-string "k")))
+    (loop for i below 1000 do
+          (handler-case
+              (lol-web/extractors::%coerce-keyword
+               (format nil "attackerKeywordInput~D~D" i (random 999999))
+               spec)
+            (extractor-coercion-error () nil)))
+    (let ((after (length (apropos-list "" :keyword))))
+      (is (= baseline after)
+          "keyword pool grew from ~D to ~D"
+          baseline after))))
+
+(test regression-coerce-symbol-bounds-keyword-pool
+  "Same bound for %coerce-symbol — :type :symbol shares the keyword pool
+   with %coerce-keyword."
+  (let ((baseline (length (apropos-list "" :keyword)))
+        (spec (make-extractor-spec :name 's :kind :query :type 'symbol
+                                   :required-p t :source-string "s")))
+    (loop for i below 1000 do
+          (handler-case
+              (lol-web/extractors::%coerce-symbol
+               (format nil "attackerSymbolInput~D~D" i (random 999999))
+               spec)
+            (extractor-coercion-error () nil)))
+    (let ((after (length (apropos-list "" :keyword))))
+      (is (= baseline after)
+          "keyword pool grew from ~D to ~D"
+          baseline after))))
+
+(test regression-coerce-symbol-string-yields-keyword
+  ":type :symbol coercion of a string resolves to a KEYWORD interned in the
+   keyword package. Keywords satisfy SYMBOLP so the SYMBOL type contract
+   holds, but a string-typed :symbol parameter never yields a non-keyword
+   symbol — the resolved value is eq the corresponding keyword literal."
+  ;; The :coerce-symbol-string-target literal below interns the target in
+  ;; :keyword at read time, so the find-symbol-bounded coercion resolves it.
+  (let* ((spec (make-extractor-spec :name 's :kind :query :type 'symbol
+                                    :required-p t :source-string "s"))
+         (result (resolve-extractor
+                  :query spec
+                  '(:query-parameters (("s" . "coerce-symbol-string-target")))
+                  nil)))
+    (is (keywordp result)
+        ":type :symbol on a string must yield a keyword, got ~S" result)
+    (is (eq :coerce-symbol-string-target result)
+        "resolved value must be eq the interned keyword, got ~S" result)
+    (is (symbolp result)
+        "the keyword still satisfies SYMBOLP (the :symbol contract)")))
+
+;;; ============================================================================
+;;; Coercion-error wire body is generic — no input-echo / name+type oracle
+;;; ============================================================================
+
+(test regression-coercion-error-body-omits-raw-value
+  "extractor-coercion-error's wire BODY is a generic message that neither
+   echoes the submitted value nor names the failing extractor, so the
+   text/plain 400 is not an input-echo / extractor-name+type oracle for an
+   unauthenticated client. The full diagnostic (raw value + extractor
+   identity) lives only in the condition REPORT, for server logs."
+  (let ((c (handler-case
+               (resolve-extractor
+                :query
+                (make-extractor-spec :name 'secret-param-name :kind :query
+                                     :type 'integer)
+                '(:query-parameters (("secret-param-name" . "sentinel-raw-12abc")))
+                nil)
+             (extractor-coercion-error (e) e))))
+    (is (typep c 'extractor-coercion-error)
+        "a non-numeric value must signal extractor-coercion-error")
+    (let ((body (lol-web/server:http-error-body c)))
+      (is (null (search "sentinel-raw-12abc" body))
+          "wire body must NOT echo the submitted value, got ~S" body)
+      (is (null (search "SECRET-PARAM-NAME" (string-upcase body)))
+          "wire body must NOT name the failing extractor, got ~S" body))
+    (let ((report (princ-to-string c)))
+      (is (search "sentinel-raw-12abc" report)
+          "the report (server log) DOES carry the raw value for diagnosis")
+      (is (search "SECRET-PARAM-NAME" (string-upcase report))
+          "the report names the failing extractor for diagnosis"))))

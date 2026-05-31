@@ -12,6 +12,9 @@
   (:import-from :let-over-lambda
                 :dlambda :defmacro!
                 :aif)
+  ;; wizard-action + form-field keys go through safe-coerce-keyword.
+  (:import-from :lol-web/escape
+                #:safe-coerce-keyword)
   (:export
    #:defwizard
    #:register-wizard
@@ -25,7 +28,9 @@
    #:list-active-wizard-sessions
    #:process-wizard-submission
    #:render-wizard-step
+   #:render-wizard-initial-step
    #:render-wizard-complete
+   #:with-wizard-state
    #:wizard-text-field
    #:wizard-select-field
    #:wizard-radio-group))

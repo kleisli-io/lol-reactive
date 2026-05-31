@@ -16,38 +16,46 @@
 ;;; DEPENDENCY TRACKING INFRASTRUCTURE
 ;;; ============================================================================
 
-;;; Reactive primitives are SINGLE-THREADED by default. *current-effect*,
-;;; *batch-depth*, *pending-effects*, and the per-signal subscribers tables
-;;; are global mutable state — concurrent threads sharing a signal graph
-;;; race on those. A typical web request runs on its own thread and never
-;;; crosses signal boundaries, so no wrapper is needed. To share signals
-;;; across threads, wrap reactive call sites in WITH-LOL-WEB-THREAD-SAFETY.
+;;; Dispatch primitives are per-thread + per-request: each new thread starts
+;;; with fresh bindings via bordeaux-threads:*default-special-bindings*, and
+;;; WITH-REACTIVE-CONTEXT layers a fresh dynamic extent around every request.
+;;; Subscribers tables and signal value cells remain shared by closure —
+;;; cross-thread signal-graph sharing still needs WITH-LOL-WEB-THREAD-SAFETY.
 
 (defparameter *current-effect* nil
-  "The currently executing effect (for automatic dependency tracking).
-   When an effect function runs, accessing any signal automatically
-   subscribes that effect to future changes.")
+  "Currently executing effect; accessing a signal during its run subscribes
+   the effect to future changes.")
 
 (defparameter *current-effect-register* nil
-  "When inside an effect that tracks its subscriptions for clean disposal,
-   this holds a unary function. Reactive sources call it with their
-   subscribers hash-table whenever they record *current-effect* as a
-   subscriber, so the effect's dispose path can later drop those
-   subscriptions and stop being re-run.")
+  "Unary function recording the subscribers tables the current effect attaches
+   to, so the effect's disposer can later unsubscribe.")
 
 (defparameter *batch-depth* 0
-  "When > 0, defer effect execution until batch completes.
-   This allows multiple state changes without intermediate re-renders.
-   Read-modify-write — not safe under concurrent access without
-   WITH-LOL-WEB-THREAD-SAFETY.")
+  "When > 0, signal updates defer their effects into *pending-effects*
+   instead of running immediately.")
 
 (defparameter *pending-effects* '()
-  "Effects waiting to run after batch completes. Mutated by signal setters
-   during batched updates — not safe under concurrent access without
-   WITH-LOL-WEB-THREAD-SAFETY.")
+  "Effects deferred during the active batch; drained when *batch-depth*
+   returns to zero.")
+
+(dolist (entry '((*current-effect* . nil)
+                 (*current-effect-register* . nil)
+                 (*batch-depth* . 0)
+                 (*pending-effects* . nil)))
+  (pushnew entry bordeaux-threads:*default-special-bindings*
+           :key #'car :test #'eq))
+
+(defmacro with-reactive-context (&body body)
+  "Fresh dynamic extent for the dispatch primitives so one request's mutation
+   cannot leak into the next on a reused thread."
+  `(let ((*current-effect* nil)
+         (*current-effect-register* nil)
+         (*batch-depth* 0)
+         (*pending-effects* '()))
+     ,@body))
 
 (defparameter *max-signal-history* 100
-  "Default maximum history entries for pandoric signals. NIL = unlimited.")
+  "Default maximum history entries for pandoric signals.")
 
 (defvar *thread-safety-lock*
   (bordeaux-threads:make-lock "lol-reactive thread-safety")
@@ -56,19 +64,9 @@
    their effect runs, batches, or signal updates on shared signal state.")
 
 (defmacro with-lol-web-thread-safety (&body body)
-  "Serialise reactive operations across threads.
-
-   Signals, effects, computed, and batch are single-threaded by default —
-   *current-effect*, *batch-depth*, *pending-effects*, and the per-signal
-   subscribers tables are global mutable state with no internal locking.
-   Wrap any cross-thread reactive call site with this macro to acquire
-   *thread-safety-lock* for the duration of BODY.
-
-   Within a single request thread, no wrapper is needed.
-
-   Example (two threads sharing a counter signal):
-     (with-lol-web-thread-safety
-       (funcall set-counter (1+ (funcall counter))))"
+  "Serialise BODY on *thread-safety-lock* — required when two threads share
+   a signal graph, because subscribers tables and value cells are shared by
+   closure capture. Single-thread use needs no wrapper."
   `(bordeaux-threads:with-lock-held (*thread-safety-lock*)
      ,@body))
 
@@ -271,8 +269,7 @@
    This is the 'Let Over Lambda' version of signals - the closure's
    internal state can be inspected and modified from outside.
 
-   MAX-HISTORY: Maximum history entries to keep (default *max-signal-history*).
-               NIL = unlimited history.
+   MAX-HISTORY: Maximum history entries to keep. NIL uses *MAX-SIGNAL-HISTORY*.
 
    Messages:
      :get () - Get value (tracks dependency)
@@ -293,11 +290,11 @@
 
    Example with custom history limit:
      (make-pandoric-signal :mouse-pos '(0 . 0) :max-history 10)
-     (make-pandoric-signal :debug-state nil :max-history nil)  ; unlimited"
+     (make-pandoric-signal :debug-state nil :max-history nil)"
   (let ((value initial-value)
         (subscribers (make-hash-table :test 'eq))
         (history '())
-        (history-limit max-history)
+        (history-limit (or max-history *max-signal-history*))
         (created-at (get-universal-time)))
     (dlambda
       ;; Get value (reactive - tracks dependency)

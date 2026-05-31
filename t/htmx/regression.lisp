@@ -16,21 +16,23 @@
 
 (test regression-oob-swap-no-duplicate-id
   "oob-swap with outerHTML doesn't wrap when content has target ID"
-  (let ((html "<div id=\"target\">content</div>"))
+  (let ((html (lol-web/html:make-safe-html-string
+               "<div id=\"target\">content</div>")))
     (let ((result (oob-swap "target" html :swap "outerHTML")))
       (is (null (search "<div id=\"target\"><div id=\"target\"" result)))
       (is (search "hx-swap-oob" result)))))
 
 (test regression-oob-swap-wrap-when-no-id
   "oob-swap still wraps when content lacks target ID"
-  (let ((html "<span>some content</span>"))
+  (let ((html (lol-web/html:make-safe-html-string "<span>some content</span>")))
     (let ((result (oob-swap "my-target" html :swap "innerHTML")))
       (is (search "id=\"my-target\"" result))
       (is (search "hx-swap-oob" result)))))
 
 (test regression-oob-swap-innerhtml-always-wraps
   "oob-swap innerHTML strategy always wraps"
-  (let ((html "<div id=\"target\">content</div>"))
+  (let ((html (lol-web/html:make-safe-html-string
+               "<div id=\"target\">content</div>")))
     (let ((result (oob-swap "target" html :swap "innerHTML")))
       (is (search "hx-swap-oob" result)))))
 
@@ -102,7 +104,7 @@
 
 (test regression-htmx-runtime-composition-markers
   "Composed htmx-runtime-js contains every behavioural marker from each cluster"
-  (let ((js (htmx-runtime-js)))
+  (let ((js (lol-web/html:safe-html-string-value (htmx-runtime-js))))
     ;; Config cluster
     (is (search "HTMX" js) "HTMX object name missing")
     (is (search "0.3.1" js) "version string missing")
@@ -248,9 +250,9 @@
 ;;; ============================================================================
 
 (test regression-hx-get-rejects-javascript-scheme
-  "javascript: URLs produce no hx-get attribute. sanitize-url returns NIL
-   for the unsafe scheme; the format string then suppresses the entire
-   hx-get pair so the payload cannot reach the rendered HTML."
+  "javascript: URLs produce no hx-get attribute. safe-url returns NIL for
+   the unsafe scheme; the format string then suppresses the entire hx-get
+   pair so the payload cannot reach the rendered HTML."
   (let ((s (hx-get "javascript:alert(1)")))
     (is (null (search "javascript:" s)))
     (is (null (search "hx-get" s))
@@ -289,4 +291,410 @@
     (is (null (search "evil\" onerror" s)))
     (is (search "&quot; onerror=alert(1)" s))
     (is (search "hx-trigger=\"click consume\"" s))))
+
+;;; ============================================================================
+;;; HX-* response-header hygiene — CR/LF + URL scheme guards
+;;; ============================================================================
+
+(defun %signals-error-p (thunk)
+  "Run THUNK; return T if it signals an error, NIL on normal return."
+  (handler-case (progn (funcall thunk) nil)
+    (error () t)))
+
+(test regression-set-htmx-redirect-rejects-script-schemes
+  "javascript:, data:, and vbscript: URLs signal — safe-url-allowlist
+   refuses them and the helper turns the miss into an error."
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p (lambda () (set-htmx-redirect "javascript:alert(1)"))))
+    (is (%signals-error-p
+         (lambda () (set-htmx-redirect "data:text/html,<script>"))))
+    (is (%signals-error-p (lambda () (set-htmx-redirect "vbscript:msgbox(1)"))))))
+
+(test regression-set-htmx-redirect-rejects-crlf
+  "A CR or LF inside the URL is a header-split vector; validate-header-value
+   refuses it."
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (set-htmx-redirect
+                     (format nil "/safe~C~CSet-Cookie: pwned=1"
+                             #\Return #\Linefeed)))))))
+
+(test regression-set-htmx-redirect-accepts-safe-url
+  "https and root-relative URLs pass through and land in HX-Redirect verbatim."
+  (lol-web/server:with-response-headers ()
+    (set-htmx-redirect "https://example.com/ok")
+    (is (equal "https://example.com/ok"
+               (%find-header "hx-redirect"
+                             (lol-web/server:get-response-headers)))))
+  (lol-web/server:with-response-headers ()
+    (set-htmx-redirect "/api/users")
+    (is (equal "/api/users"
+               (%find-header "hx-redirect"
+                             (lol-web/server:get-response-headers))))))
+
+(test regression-set-htmx-location-rejects-script-scheme
+  "The path sub-field routes through safe-url-allowlist whether or not
+   :target / :swap are supplied."
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (set-htmx-location "javascript:alert(1)"))))
+    (is (%signals-error-p
+         (lambda () (set-htmx-location "javascript:alert(1)"
+                                       :target "#main" :swap "innerHTML"))))))
+
+(test regression-set-htmx-location-encodes-json-with-target
+  "With :target or :swap the header value is a JSON object carrying path,
+   target, and/or swap."
+  (lol-web/server:with-response-headers ()
+    (set-htmx-location "/dashboard" :target "#main" :swap "innerHTML")
+    (let ((val (%find-header "hx-location"
+                             (lol-web/server:get-response-headers))))
+      (is (stringp val))
+      (is (search "/dashboard" val))
+      (is (search "#main" val))
+      (is (search "innerHTML" val))
+      (is (search "{" val)))))
+
+(test regression-set-htmx-trigger-symbol-event-name-becomes-string
+  "A symbol event-name jsonifies to its downcased name (a JS string
+   literal shape), never a bare identifier the browser could coerce."
+  (lol-web/server:with-response-headers ()
+    (set-htmx-trigger 'cartUpdated)
+    (is (equal "cartupdated"
+               (%find-header "hx-trigger"
+                             (lol-web/server:get-response-headers))))))
+
+(test regression-set-htmx-trigger-rejects-cons-event-name
+  "A cons in event-name has no string shape; jsonify signals."
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (set-htmx-trigger '(alert "click"))))))
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (set-htmx-trigger '(alert "click") '((item . "x"))))))))
+
+(test regression-set-htmx-trigger-rejects-crlf-in-name
+  "CR or LF in a string event-name signals via validate-header-value."
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (set-htmx-trigger
+                     (format nil "evt~CSet-Cookie: x=1" #\Return)))))))
+
+(test regression-set-htmx-trigger-detail-uses-sanitized-key
+  "With event-detail the JSON key is the jsonified event-name — symbols
+   become downcased strings rather than appearing as Lisp identifiers."
+  (lol-web/server:with-response-headers ()
+    (set-htmx-trigger 'cartUpdated '((item . "x")))
+    (let ((val (%find-header "hx-trigger"
+                             (lol-web/server:get-response-headers))))
+      (is (stringp val))
+      (is (search "cartupdated" val)
+          "JSON key must be the downcased symbol name")
+      (is (search "\"cartupdated\"" val)
+          "key must be quoted as a JSON string"))))
+
+(test regression-with-htmx-response-retarget-rejects-crlf
+  "CR or LF in any header-value-shaped field signals."
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (with-htmx-response
+                        (:retarget (format nil "#main~CX-Pwned: 1" #\Return))
+                      "<p>x</p>")))))
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (with-htmx-response
+                        (:reswap (format nil "innerHTML~C" #\Linefeed))
+                      "<p>x</p>"))))))
+
+(test regression-with-htmx-response-push-url-rejects-script-scheme
+  ":push-url and :replace-url route through safe-url-allowlist."
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (with-htmx-response (:push-url "javascript:alert(1)")
+                      "<p>x</p>")))))
+  (lol-web/server:with-response-headers ()
+    (is (%signals-error-p
+         (lambda () (with-htmx-response (:replace-url "data:text/html,x")
+                      "<p>x</p>"))))))
+
+(test regression-with-htmx-response-trigger-symbol-becomes-string
+  "A bare symbol :trigger jsonifies to its downcased name."
+  (let ((evt 'cartUpdated))
+    (lol-web/server:with-response-headers ()
+      (with-htmx-response (:trigger evt)
+        "<p>x</p>")
+      ;; jsonify of a symbol returns its downcased name as a string;
+      ;; validate-header-value then accepts it verbatim.
+      (is (equal "cartupdated"
+                 (%find-header "hx-trigger"
+                               (lol-web/server:get-response-headers)))))))
+
+;;; ============================================================================
+;;; OOB selector allowlist + signed-token escape hatch
+;;; ============================================================================
+
+(defun %signals-unsafe-oob-p (thunk)
+  "Run THUNK; return T iff it signals UNSAFE-OOB-SELECTOR (or its subclass)."
+  (handler-case (progn (funcall thunk) nil)
+    (lol-web/htmx:unsafe-oob-selector () t)))
+
+(test regression-oob-target-allowlist-rejects-body
+  "validate-oob-selector refuses every selector in the default denylist —
+   `body`, `head`, `html`, top-level `form` — even when *oob-selector-allowlist*
+   is left permissive (NIL). Re-admitting these via a signed token also
+   fails: the denylist is the hard gate."
+  (let ((lol-web/htmx:*oob-selector-allowlist* nil)
+        (lol-web/htmx:*oob-signed-selector-secret* nil))
+    (dolist (sel '("body" "head" "html" "form" "FORM" "form[name='x']"))
+      (is (%signals-unsafe-oob-p
+           (lambda () (lol-web/htmx:validate-oob-selector sel)))
+          "selector ~S must be refused" sel))))
+
+(test regression-oob-allowlist-tightens-when-set
+  "Setting *oob-selector-allowlist* to a non-NIL list tightens validation:
+   selectors that previously passed (permissive default) must now match
+   one of the allowlist entries or fail :not-allowlisted."
+  (let ((lol-web/htmx:*oob-selector-allowlist*
+         '((:id "comp-1") (:class "card")))
+        (lol-web/htmx:*oob-signed-selector-secret* nil))
+    (is (string= "#comp-1"
+                 (lol-web/htmx:validate-oob-selector "#comp-1")))
+    (is (string= ".card"
+                 (lol-web/htmx:validate-oob-selector ".card")))
+    (is (%signals-unsafe-oob-p
+         (lambda () (lol-web/htmx:validate-oob-selector "#comp-2")))
+        "selector outside the allowlist must signal")))
+
+(test regression-oob-signed-selector-accepted
+  "A signed token whose payload string-equals the selector re-admits an
+   otherwise-disallowed selector through a tightened allowlist; the
+   denylist still refuses regardless of the token."
+  (let* ((secret (ironclad:random-data 32))
+         (lol-web/htmx:*oob-selector-allowlist* '((:id "comp-1")))
+         (lol-web/htmx:*oob-signed-selector-secret* secret)
+         (selector "#escape-hatch")
+         (token (lol-web/htmx:mint-oob-selector-token selector)))
+    (is (string= selector
+                 (lol-web/htmx:validate-oob-selector selector :signed-token token))
+        "matching token re-admits the selector")
+    (is (%signals-unsafe-oob-p
+         (lambda ()
+           (lol-web/htmx:validate-oob-selector "body" :signed-token token)))
+        "denylist still refuses even with a signed token in hand")
+    (let ((bad (lol-web/htmx:mint-oob-selector-token "#different-target")))
+      (is (%signals-unsafe-oob-p
+           (lambda ()
+             (lol-web/htmx:validate-oob-selector selector :signed-token bad)))
+          "token whose payload differs from the selector is refused"))))
+
+;;; ============================================================================
+;;; OOB primitives — safe-html-string contract at every entry
+;;; ============================================================================
+
+(test regression-oob-swap-refuses-raw-content
+  "oob-swap signals when content is a bare string — the producer must
+   pass a safe-html-string so the type carries the safety claim across
+   the call boundary."
+  (is (%signals-error-p
+       (lambda () (oob-swap "target" "<b>raw</b>")))))
+
+(test regression-make-oob-swap-refuses-raw-content
+  "make-oob-swap mirrors oob-swap's type discipline."
+  (let ((lol-web/htmx:*oob-selector-allowlist* '((:id "ok"))))
+    (is (%signals-error-p
+         (lambda () (make-oob-swap "#ok" "<b>raw</b>"))))))
+
+(test regression-oob-content-refuses-raw-content
+  "oob-content refuses raw strings."
+  (is (%signals-error-p
+       (lambda () (oob-content "counter" "42")))))
+
+(test regression-render-with-oob-refuses-raw-content
+  "render-with-oob refuses raw strings in primary content and in each
+   OOB update slot — every content boundary takes safe-html-string."
+  (is (%signals-error-p
+       (lambda () (render-with-oob "<main>raw</main>"))))
+  (is (%signals-error-p
+       (lambda () (render-with-oob
+                    nil
+                    (list "count" "5"))))))
+
+(test regression-render-with-oob-accepts-safe-html
+  "Wrapping primary content and per-update content in safe-html-string
+   passes the check-type; the rendered string contains both."
+  (let ((result (render-with-oob
+                  (lol-web/html:make-safe-html-string "<main>ok</main>")
+                  (list "count"
+                        (lol-web/html:make-safe-html-string "5")))))
+    (is (stringp result))
+    (is (search "<main>ok</main>" result))
+    (is (search "id=\"count\"" result))
+    (is (search "5" result))))
+
+;;; ============================================================================
+;;; sanitize-hx-on-attrs — broadcast-wire strip
+;;; ============================================================================
+
+(test regression-sanitize-hx-on-attrs-strips-double-quoted
+  "Double-quoted hx-on-* attributes are removed entirely; the rest of
+   the tag survives."
+  (let ((out (lol-web/escape:sanitize-hx-on-attrs
+              "<button id=\"x\" hx-on-click=\"alert(1)\">y</button>")))
+    (is (not (search "hx-on" out)))
+    (is (not (search "alert(1)" out)))
+    (is (search "id=\"x\"" out))
+    (is (search ">y</button>" out))))
+
+(test regression-sanitize-hx-on-attrs-strips-single-quoted
+  "Single-quoted attribute values are equally removed."
+  (let ((out (lol-web/escape:sanitize-hx-on-attrs
+              "<a hx-on-click='evil()' href=\"/ok\">link</a>")))
+    (is (not (search "hx-on" out)))
+    (is (not (search "evil()" out)))
+    (is (search "href=\"/ok\"" out))))
+
+(test regression-sanitize-hx-on-attrs-strips-htmx-event-variants
+  "hx-on-htmx-* and hx-on--* (long-form and short-form htmx event syntax)
+   are both stripped."
+  (let ((out (lol-web/escape:sanitize-hx-on-attrs
+              "<div hx-on-htmx-after-swap=\"a()\" hx-on--load=\"b()\">z</div>")))
+    (is (not (search "hx-on" out)))
+    (is (not (search "a()" out)))
+    (is (not (search "b()" out)))
+    (is (search ">z</div>" out))))
+
+(test regression-sanitize-hx-on-attrs-leaves-text-mentions-alone
+  "Text content like `hx-on-click` (no `=` after the identifier) is left
+   alone — only attribute syntax is stripped."
+  (let ((out (lol-web/escape:sanitize-hx-on-attrs
+              "<p>Use hx-on-click to bind handlers.</p>")))
+    (is (search "hx-on-click" out)
+        "prose mentions outside attribute syntax must survive")))
+
+(test regression-sanitize-hx-on-attrs-leaves-other-attrs-alone
+  "Non-hx-on attributes (hx-get, hx-trigger, data-*) are untouched."
+  (let ((out (lol-web/escape:sanitize-hx-on-attrs
+              "<div hx-get=\"/api\" data-foo=\"bar\">x</div>")))
+    (is (search "hx-get=\"/api\"" out))
+    (is (search "data-foo=\"bar\"" out))))
+
+;;; ============================================================================
+;;; emit-hx-attrs / hx-morph / oob-content / render-autocomplete attribute sinks
+;;; ============================================================================
+
+(test regression-emit-hx-attrs-rejects-javascript-url
+  "emit-hx-attrs runs the URL through safe-url; a javascript: scheme
+   yields NIL and the format string suppresses the entire hx-<verb> pair.
+   target/swap/trigger are attribute-escaped on the happy path."
+  (let ((s (emit-hx-attrs "get" "javascript:alert(1)" nil nil nil)))
+    (is (null (search "javascript" s)))
+    (is (null (search "hx-get" s))))
+  (let ((s (emit-hx-attrs "post" "/api/x" "#out" "innerHTML" "click")))
+    (is (search "hx-post=\"/api/x\"" s))
+    (is (search "hx-target=\"#out\"" s))
+    (is (search "hx-swap=\"innerHTML\"" s))))
+
+(test regression-hx-morph-escapes-attributes
+  "hx-morph routes url/target/trigger through emit-hx-attrs: a `\"` in a
+   value is attribute-escaped so it cannot break out, and a javascript:
+   url is suppressed entirely."
+  (let ((s (hx-morph "/api/search"
+                     :target "evil\" onerror=alert(1)"
+                     :trigger "input")))
+    (is (search "hx-get=\"/api/search\"" s))
+    (is (search "&quot; onerror=alert(1)" s))
+    (is (null (search "evil\" onerror" s))))
+  (is (null (search "javascript" (hx-morph "javascript:alert(1)")))))
+
+(test regression-oob-content-validates-selector
+  "oob-content routes its `#ID` through validate-oob-selector, so a
+   tightened allowlist accepts an in-list id and refuses one outside it."
+  (let ((lol-web/htmx:*oob-selector-allowlist* '((:id "good")))
+        (lol-web/htmx:*oob-signed-selector-secret* nil))
+    (is (search "innerHTML:#good"
+                (oob-content "good" (lol-web/html:make-safe-html-string "x"))))
+    (is (%signals-unsafe-oob-p
+         (lambda ()
+           (oob-content "evil" (lol-web/html:make-safe-html-string "x")))))))
+
+(test regression-autocomplete-endpoint-safe-href
+  "render-autocomplete emits its endpoint through safe-href: a
+   javascript: endpoint produces no hx-get attribute; a safe relative
+   endpoint passes through."
+  (let ((s (render-autocomplete :id "ac" :endpoint "javascript:alert(1)")))
+    (is (null (search "javascript" s)))
+    (is (null (search "hx-get" s))))
+  (let ((s (render-autocomplete :id "ac" :endpoint "/api/search")))
+    (is (search "hx-get=" s))
+    (is (search "/api/search" s))))
+
+(test regression-oob-swap-escapes-hostile-id
+  "oob-swap routes its id and swap through safe-attr, so a `\"` in the id
+   cannot close the attribute and graft a sibling event handler. The
+   default NIL allowlist lets the hostile id reach the splice — escaping,
+   not selector validation, is what closes the breakout."
+  (let ((lol-web/htmx:*oob-selector-allowlist* nil)
+        (lol-web/htmx:*oob-signed-selector-secret* nil))
+    (let ((s (oob-swap "x\" onmouseover=\"alert(1)"
+                       (lol-web/html:make-safe-html-string "ok"))))
+      (is (search "&quot;" s))
+      (is (null (search "\" onmouseover=\"alert" s))
+          "raw quote breakout must not survive into the id attribute")
+      (is (search "ok" s) "the safe body still emits"))))
+
+(test regression-oob-content-escapes-hostile-id
+  "oob-content folds the id into the hx-swap-oob value; routing the whole
+   `innerHTML:#ID` through safe-attr keeps a hostile id from closing the
+   attribute."
+  (let ((lol-web/htmx:*oob-selector-allowlist* nil)
+        (lol-web/htmx:*oob-signed-selector-secret* nil))
+    (let ((s (oob-content "x\" onmouseover=\"alert(1)"
+                          (lol-web/html:make-safe-html-string "ok"))))
+      (is (search "&quot;" s))
+      (is (null (search "\" onmouseover=\"alert" s)))
+      (is (search "innerHTML:#x" s) "the selector prefix is preserved"))))
+
+(test regression-autocomplete-escapes-attributes
+  "render-autocomplete routes id/placeholder/class through safe-attr, so a
+   placeholder closing the input and opening a <script> is neutralized."
+  (let ((s (render-autocomplete
+            :id "ac"
+            :endpoint "/api/search"
+            :placeholder "x\"><script>alert(1)</script>")))
+    (is (null (search "<script>alert(1)" s))
+        "no raw <script> may survive the placeholder splice")
+    (is (search "&lt;script" s))
+    (is (search "&quot;" s)))
+  (let ((s (render-autocomplete
+            :id "x\"><img src=x onerror=alert(1)>"
+            :endpoint "/api/search")))
+    (is (null (search "\"><img" s))
+        "a hostile id cannot break out of any of its attribute sinks")
+    (is (search "&lt;img" s))))
+
+;;; ============================================================================
+;;; find-tag-end / inject-oob-attribute — single-quoted attribute values
+;;; ============================================================================
+
+(test regression-find-tag-end-single-quoted-gt
+  "find-tag-end skips a `>` inside a single-quoted attribute value (not only
+   double-quoted), and a quote of the opposite kind inside the active run is a
+   literal, so the returned offset is the real opening-tag close."
+  (is (= 17 (lol-web/htmx::find-tag-end "<div data-x='a>b'>"))
+      "single-quoted attribute: the `>` at index 14 is inside the quotes")
+  (is (= 18 (lol-web/htmx::find-tag-end "<div data-x='a\">b'>"))
+      "a double-quote inside a single-quoted run is literal, not a toggle")
+  (is (= 17 (lol-web/htmx::find-tag-end "<div data-x=\"a>b\">"))
+      "double-quoted handling still holds (single-quote support is a superset)"))
+
+(test regression-inject-oob-single-quoted-gt
+  "inject-oob-attribute finds the real tag end past a single-quoted attribute
+   whose value contains `>`, so hx-swap-oob lands after the attribute (not
+   mid-value) and the attribute survives intact."
+  (let ((result (lol-web/htmx::inject-oob-attribute
+                 "<div data-x='a>b'>content</div>" "true")))
+    (is (search "data-x='a>b'" result)
+        "the single-quoted attribute value is preserved verbatim")
+    (is (search "data-x='a>b' hx-swap-oob=\"true\">" result)
+        "hx-swap-oob is injected at the real tag end, right after the attribute")))
 

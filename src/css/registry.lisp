@@ -41,7 +41,10 @@
   "Create a CSS module with pandoric introspection.
 
    NAME: Keyword identifying the module (e.g., :buttons)
-   INITIAL-RULES: List of (selector . properties-alist) pairs
+   INITIAL-RULES: List of (selector . properties-alist) pairs. Each
+   selector is validated against `safe-css-selector-p`; an unsafe
+   selector signals UNSAFE-CSS-SELECTOR at registration time so a
+   malformed rule never enters the registry.
 
    Returns a dlambda responding to:
      :name      - Get module name
@@ -54,69 +57,88 @@
    (make-css-module :buttons
      '(\".btn\" . ((\"padding\" . \"1rem\")))
      '(\".btn:hover\" . ((\"opacity\" . \"0.8\"))))"
+  (dolist (rule initial-rules)
+    (let ((selector (car rule)))
+      ;; @-rules (@media, @keyframes, @supports) carry their own selector
+      ;; on inner blocks; the top-level `@media (...)` string is gated by
+      ;; the same predicate so attacker-supplied media queries cannot
+      ;; close the rule.
+      (unless (safe-css-selector-p selector)
+        (error 'unsafe-css-selector :selector selector))))
   (let ((module-name name)
         (rules (copy-list initial-rules))
+        (rules-lock (bordeaux-threads:make-recursive-lock
+                     (format nil "lol-web/css module ~A" name)))
         (created-at (get-universal-time)))
     (bordeaux-threads:with-recursive-lock-held (*css-registry-lock*)
-      ;; Auto-register in global registry. The closure body runs later
-      ;; under callers' threads — its mutation of the per-module `rules`
-      ;; alist is bounded to that module instance and not shared state,
-      ;; so it does not need the registry lock.
+      ;; Auto-register in global registry. The closure body runs later under
+      ;; callers' threads, so the per-module rules list has its own lock.
       (setf (gethash name *component-css-registry*)
             (lambda (message &rest args)
               (case message
                 (:name module-name)
 
-                (:rules rules)
+                (:rules
+                 (bordeaux-threads:with-recursive-lock-held (rules-lock)
+                   (copy-list rules)))
 
                 (:add-rule
                  (destructuring-bind (selector properties) args
-                   (push (cons selector properties) rules)
+                   (unless (safe-css-selector-p selector)
+                     (error 'unsafe-css-selector :selector selector))
+                   (bordeaux-threads:with-recursive-lock-held (rules-lock)
+                     (push (cons selector properties) rules))
                    selector))
 
                 (:remove-rule
                  (let ((selector (first args)))
-                   (setf rules (remove-if (lambda (r) (string= (car r) selector)) rules))
+                   (bordeaux-threads:with-recursive-lock-held (rules-lock)
+                     (setf rules
+                           (remove-if (lambda (r) (string= (car r) selector))
+                                      rules)))
                    selector))
 
                 (:render
-                 ;; Each branch delegates to css-rule / css-keyframes from
-                 ;; generation.lisp so symbol/keyword property keys are
-                 ;; normalised the same way regardless of which entry
-                 ;; point a caller takes.
-                 (with-output-to-string (out)
-                   (dolist (rule rules)
-                     (let ((selector (car rule))
-                           (props (cdr rule)))
-                       (cond
-                         ;; "@keyframes <name>" — strip the 11-char prefix
-                         ;; and pass the frame list to css-keyframes.
-                         ((and (stringp selector)
-                               (>= (length selector) 11)
-                               (string= (subseq selector 0 11) "@keyframes "))
-                          (format out "~A~%"
-                                  (apply #'css-keyframes
-                                         (subseq selector 11)
-                                         props)))
-                         ;; "@media ..." — props is a list of (sel props)
-                         ;; pairs; render each nested rule via css-rule.
-                         ((and (stringp selector)
-                               (>= (length selector) 6)
-                               (string= (subseq selector 0 6) "@media"))
-                          (format out "~A {~%" selector)
-                          (dolist (inner-rule props)
-                            (let ((inner-sel (first inner-rule))
-                                  (inner-props (second inner-rule)))
-                              (format out "  ~A~%" (css-rule inner-sel inner-props))))
-                          (format out "}~%"))
-                         (t
-                          (format out "~A~%" (css-rule selector props))))))))
+                 (let ((snapshot
+                         (bordeaux-threads:with-recursive-lock-held (rules-lock)
+                           (copy-list rules))))
+                   ;; Each branch delegates to css-rule / css-keyframes from
+                   ;; generation.lisp so symbol/keyword property keys are
+                   ;; normalised the same way regardless of entry point.
+                   (with-output-to-string (out)
+                     (dolist (rule snapshot)
+                       (let ((selector (car rule))
+                             (props (cdr rule)))
+                         (cond
+                           ;; "@keyframes <name>" — strip the 11-char prefix
+                           ;; and pass the frame list to css-keyframes.
+                           ((and (stringp selector)
+                                 (>= (length selector) 11)
+                                 (string= (subseq selector 0 11) "@keyframes "))
+                            (format out "~A~%"
+                                    (apply #'css-keyframes
+                                           (subseq selector 11)
+                                           props)))
+                           ;; "@media ..." — props is a list of (sel props)
+                           ;; pairs; render each nested rule via css-rule.
+                           ((and (stringp selector)
+                                 (>= (length selector) 6)
+                                 (string= (subseq selector 0 6) "@media"))
+                            (format out "~A {~%" selector)
+                            (dolist (inner-rule props)
+                              (let ((inner-sel (first inner-rule))
+                                    (inner-props (second inner-rule)))
+                                (format out "  ~A~%" (css-rule inner-sel inner-props))))
+                            (format out "}~%"))
+                           (t
+                            (format out "~A~%" (css-rule selector props)))))))))
 
                 (:inspect
-                 (list :name module-name
-                       :created-at created-at
-                       :rule-count (length rules)
-                       :rules rules))
+                 (bordeaux-threads:with-recursive-lock-held (rules-lock)
+                   (list :name module-name
+                         :created-at created-at
+                         :rule-count (length rules)
+                         :rules (copy-list rules))))
 
                 (otherwise
                  (error "Unknown CSS module message: ~S" message)))))

@@ -11,5 +11,15 @@
                 :symb)
   (:export
    #:reactive-script
+   #:jsonify
    #:on-click
-   #:on-change))
+   #:on-change
+   #:on-submit
+   #:hx-dispatch
+   #:hx-bind
+   ;; safety.lisp
+   #:safe-js-string-literal
+   #:safe-js-string-literal-p
+   #:safe-js-string-literal-value
+   #:make-safe-js-string-literal
+   #:escape-js-string))

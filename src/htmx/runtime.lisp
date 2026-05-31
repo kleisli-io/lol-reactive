@@ -101,59 +101,66 @@
    Composes pairs from runtime/config.lisp, runtime/swap.lisp, runtime/ajax.lisp,
    runtime/triggers.lisp, plus the public API defined here, into a single
    *htmx* object literal. Splices via ps:ps* + quasiquote to preserve the
-   literal one-object-init shape — every property lands in one (ps:create ...)."
-  (parenscript:ps*
-   `(defvar *htmx*
-      (ps:create
-       ,@(htmx-runtime-config-pairs)
-       ,@(htmx-runtime-swap-pairs)
-       ,@(htmx-runtime-ajax-pairs)
-       ,@(htmx-runtime-triggers-pairs)
-       ,@(htmx-runtime-public-api-pairs)))
+   literal one-object-init shape — every property lands in one (ps:create ...).
 
-   ;; Auto-initialize on DOMContentLoaded
-   `(if (= (ps:@ document ready-state) "loading")
-        (ps:chain document (add-event-listener "DOMContentLoaded"
-                                               (ps:@ *htmx* init)))
-        ((ps:@ *htmx* init)))
+   Returns a SAFE-HTML-STRING so html-page emits the script verbatim
+   instead of escaping it."
+  (lol-web/html:make-safe-html-string
+   (parenscript:ps*
+    `(defvar *htmx*
+       (ps:create
+        ,@(htmx-runtime-config-pairs)
+        ,@(htmx-runtime-swap-pairs)
+        ,@(htmx-runtime-ajax-pairs)
+        ,@(htmx-runtime-triggers-pairs)
+        ,@(htmx-runtime-public-api-pairs)))
 
-   ;; Lowercase alias for compatibility with standard htmx naming
-   `(setf (ps:@ window htmx) *htmx*)))
+    ;; Auto-initialize on DOMContentLoaded
+    `(if (= (ps:@ document ready-state) "loading")
+         (ps:chain document (add-event-listener "DOMContentLoaded"
+                                                (ps:@ *htmx* init)))
+         ((ps:@ *htmx* init)))
+
+    ;; Lowercase alias for compatibility with standard htmx naming
+    `(setf (ps:@ window htmx) *htmx*))))
 
 ;;; ============================================================================
 ;;; HTMX ATTRIBUTE HELPERS
 ;;; ============================================================================
 
-(defun %hx-attrs (verb url target swap trigger)
-  "Render `hx-<verb>=\"<url>\"` plus optional hx-target/hx-swap/hx-trigger
-   pairs. URL is run through `sanitize-url` (rejects javascript:/data:/
+(defun emit-hx-attrs (verb url target swap trigger)
+  "Canonical scheme-guarded, value-escaped emitter for htmx verb attributes.
+   Render `hx-<verb>=\"<url>\"` plus optional hx-target/hx-swap/hx-trigger
+   pairs. URL is run through `safe-url` (rejects javascript:/data:/
    vbscript: schemes — returns NIL, suppressing the attribute via
-   `~@[~]`) and then `sanitize-attribute`. TARGET/SWAP/TRIGGER are also
-   `sanitize-attribute`d since they may carry caller-controlled data."
-  (let ((safe-url (lol-web/sanitize:sanitize-attribute
-                   (lol-web/sanitize:sanitize-url url))))
+   `~@[~]`) and then `escape-attribute`. TARGET/SWAP/TRIGGER are also
+   `escape-attribute`d since they may carry caller-controlled data.
+   hx-get/hx-post/hx-put/hx-delete and hx-morph all route through this so the
+   scheme guard and escaping cannot drift between them."
+  (let ((safe-url (lol-web/escape:escape-attribute
+                   (lol-web/escape:safe-url url))))
     (format nil "~@[hx-~A=\"~a\"~]~@[ hx-target=\"~a\"~]~@[ hx-swap=\"~a\"~]~@[ hx-trigger=\"~a\"~]"
             (and safe-url verb) safe-url
-            (lol-web/sanitize:sanitize-attribute target)
-            (lol-web/sanitize:sanitize-attribute swap)
-            (lol-web/sanitize:sanitize-attribute trigger))))
+            (lol-web/escape:escape-attribute target)
+            (lol-web/escape:escape-attribute swap)
+            (lol-web/escape:escape-attribute trigger))))
 
 (defun hx-get (url &key target swap trigger)
   "Generate hx-get attribute string for cl-who. Unsafe URL schemes
    suppress the attribute; target/swap/trigger are attribute-escaped."
-  (%hx-attrs "get" url target swap trigger))
+  (emit-hx-attrs "get" url target swap trigger))
 
 (defun hx-post (url &key target swap trigger)
   "Generate hx-post attribute string for cl-who. Unsafe URL schemes
    suppress the attribute; target/swap/trigger are attribute-escaped."
-  (%hx-attrs "post" url target swap trigger))
+  (emit-hx-attrs "post" url target swap trigger))
 
 (defun hx-put (url &key target swap trigger)
   "Generate hx-put attribute string for cl-who. Unsafe URL schemes
    suppress the attribute; target/swap/trigger are attribute-escaped."
-  (%hx-attrs "put" url target swap trigger))
+  (emit-hx-attrs "put" url target swap trigger))
 
 (defun hx-delete (url &key target swap trigger)
   "Generate hx-delete attribute string for cl-who. Unsafe URL schemes
    suppress the attribute; target/swap/trigger are attribute-escaped."
-  (%hx-attrs "delete" url target swap trigger))
+  (emit-hx-attrs "delete" url target swap trigger))

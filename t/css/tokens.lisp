@@ -51,6 +51,31 @@
   "validate-token returns the token for a known key"
   (is (eq :primary (validate-token :primary *colors* "color"))))
 
+(test regression-validate-token-length-cap
+  "Tokens whose symbol-name exceeds *validate-token-max-length* are
+   rejected before the O(n*m) Levenshtein suggestion path runs. With
+   the cap at the default 256, an attacker-controlled key 257 chars
+   long must error with a length message — not a 'did you mean?' one."
+  (let ((huge (intern (concatenate 'string
+                                    ":"
+                                    (make-string (1+ *validate-token-max-length*)
+                                                 :initial-element #\A))
+                      :keyword)))
+    (handler-case (validate-token huge *colors* "color")
+      (error (c)
+        (let ((msg (princ-to-string c)))
+          (is (search "maximum length" msg)
+              "long token must error with length message, not suggestion"))))))
+
+(test regression-validate-token-cap-is-tunable
+  "Lowering *validate-token-max-length* shrinks the accepted token-name
+   bound. Bind to 8 and a 9-char key must be rejected by length."
+  (let ((*validate-token-max-length* 8))
+    (handler-case (validate-token :nineletter *colors* "color")
+      (error (c)
+        (let ((msg (princ-to-string c)))
+          (is (search "maximum length" msg)))))))
+
 ;;; ============================================================================
 ;;; Levenshtein distance
 ;;; ============================================================================
@@ -83,6 +108,18 @@
     (is (search "--space-4: 1rem" css))
     (is (search "--effect-shadow-md: 0 0 4px rgba(0,0,0,0.1)" css))))
 
+(test regression-generate-css-variables-escapes-token-values
+  "Design-token values are CSS-escaped before variable emission."
+  (let ((css (generate-css-variables
+              :colors '((:danger . "red;}body{color:red"))
+              :typography '((:family . "Inter<script>"))
+              :spacing '()
+              :effects '())))
+    (is (search "--color-danger: red\\3B \\7D body{color:red" css))
+    (is (search "--font-family: Inter\\3C script\\3E " css))
+    (is (null (search "red;}body" css)))
+    (is (null (search "<script>" css)))))
+
 (test generate-css-variables-uses-dynamic-defaults
   "Calling without keyword args reads the dynamic *colors* / *typography* etc."
   (let* ((*colors*     '((:probe-bg . "#123456")))
@@ -94,3 +131,24 @@
     (is (search "--font-family: probe-font" css))
     (is (search "--space-probe-4: 0.4rem" css))
     (is (search "--effect-probe-effect: probe-value" css))))
+
+(test regression-css-token-name-validated
+  "generate-css-variables and tailwind-config validate token NAMES via
+   safe-css-ident-p on the prefixed `prefix-name` segment, so a numeric
+   spacing name (:4 -> --space-4) passes while a metacharacter-bearing
+   key that would smuggle a `;`/`}`/`<` boundary into the declaration is
+   refused with unsafe-css-ident."
+  (let ((css (generate-css-variables :colors nil :typography nil
+                                     :spacing '((:|4| . "1rem")) :effects nil)))
+    (is (search "--space-4: 1rem;" css)))
+  (let ((css (generate-css-variables :colors '((:primary . "#000"))
+                                     :typography nil :spacing nil :effects nil)))
+    (is (search "--color-primary: #000;" css)))
+  (signals unsafe-css-ident
+    (generate-css-variables :colors (list (cons (intern "x; color:red" :keyword) "#000"))
+                            :typography nil :spacing nil :effects nil))
+  (signals unsafe-css-ident
+    (generate-css-variables :colors nil :typography nil :spacing nil
+                            :effects (list (cons (intern "y}injected" :keyword) "0"))))
+  (signals unsafe-css-ident
+    (tailwind-config :colors (list (cons (intern "z<x" :keyword) "#000")))))

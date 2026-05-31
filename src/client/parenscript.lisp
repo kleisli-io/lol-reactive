@@ -35,37 +35,82 @@
   `(ps (lambda ,args ,@body)))
 
 ;;; ============================================================================
+;;; JS-LITERAL COERCION
+;;; ============================================================================
+
+(defun jsonify (val)
+  "Coerce VAL to a value parenscript will emit as a JS literal.
+   Strings, numbers, T, and NIL pass through unchanged. Symbols are
+   downcased to their string name. Conses and any other type signal a
+   simple-error rather than reach JS code position."
+  (typecase val
+    (string  val)
+    (integer val)
+    (number  val)
+    (null    nil)
+    ((eql t) t)
+    (symbol  (string-downcase (symbol-name val)))
+    (cons    (error "jsonify: refusing to emit cons ~S as JS literal" val))
+    (t       (error "jsonify: refusing to emit ~S (type ~A) as JS literal"
+                    val (type-of val)))))
+
+;;; ============================================================================
 ;;; COMPONENT EVENT HANDLERS
 ;;; ============================================================================
 
 (defun on-click (component-id action &rest args)
   "Generate an onclick handler that dispatches to a component.
-   Uses Parenscript for type-safe JavaScript generation."
-  (parenscript:ps* `(funcall dispatch ,component-id ,action ,@args)))
+   COMPONENT-ID must be a string; ACTION must be a string or symbol;
+   ARGS each route through JSONIFY so only JS literals reach code position."
+  (check-type component-id string)
+  (check-type action (or string symbol))
+  (parenscript:ps* `(funcall dispatch ,component-id ,(jsonify action)
+                             ,@(mapcar #'jsonify args))))
 
 (defun on-change (component-id state-key)
   "Generate an onchange handler that updates component state.
-   Uses Parenscript for type-safe JavaScript generation."
-  (parenscript:ps* `(funcall set-state ,component-id ,state-key
+   COMPONENT-ID must be a string; STATE-KEY must be a string or symbol
+   and routes through JSONIFY."
+  (check-type component-id string)
+  (check-type state-key (or string symbol))
+  (parenscript:ps* `(funcall set-state ,component-id ,(jsonify state-key)
                              (ps:@ this value))))
 
 (defun on-submit (component-id action)
   "Generate an onsubmit handler.
-   Uses Parenscript for type-safe JavaScript generation."
+   COMPONENT-ID must be a string; ACTION must be a string or symbol
+   and routes through JSONIFY."
+  (check-type component-id string)
+  (check-type action (or string symbol))
   (concatenate 'string
     (parenscript:ps* `((ps:@ event prevent-default)))
     " "
-    (parenscript:ps* `(funcall dispatch ,component-id ,action
+    (parenscript:ps* `(funcall dispatch ,component-id ,(jsonify action)
                                (ps:new (-Form-Data this))))))
 
 (defun js-value (val)
-  "Convert a Lisp value to JavaScript literal."
-  (typecase val
-    (null "null")  ; Must come before symbol since NIL is both
-    (string (format nil "'~a'" val))
-    (number (format nil "~a" val))
-    (symbol (format nil "'~a'" (string-downcase val)))
-    (t (format nil "~a" val))))
+  "Convert a Lisp value to a SAFE-JS-STRING-LITERAL whose VALUE field
+   holds the JS source representation.
+
+   - NIL    → \"null\"
+   - number → its printed form
+   - string → single-quoted, with `'`, `\"`, `\\`, `\\n`, `\\r`, `<`,
+     U+2028, U+2029 escaped
+   - symbol → single-quoted, lowercased, with the same escapes as string
+   - SAFE-JS-STRING-LITERAL → returned unchanged
+   - other  → TYPE-ERROR (use a string accessor / explicit conversion)"
+  (cond
+    ((safe-js-string-literal-p val) val)
+    ((null val)                     (%make-safe-js-string-literal :value "null"))
+    ((numberp val)                  (%make-safe-js-string-literal
+                                     :value (princ-to-string val)))
+    ((stringp val)                  (make-safe-js-string-literal val))
+    ((symbolp val)                  (make-safe-js-string-literal
+                                     (string-downcase (symbol-name val))))
+    (t (error 'type-error
+              :datum val
+              :expected-type '(or null number string symbol
+                               safe-js-string-literal)))))
 
 ;;; ============================================================================
 ;;; CLIENT-SIDE REACTIVE STATE (Parenscript)
@@ -203,14 +248,54 @@
 ;;; ============================================================================
 
 (defun hx-dispatch (component-id action &rest args)
-  "Generate data attributes for HTMX-style behavior."
-  (format nil "data-dispatch=\"~a\" data-action=\"~a\"~{~a~}"
-          component-id
-          action
+  "Generate data attributes for HTMX-style behavior.
+
+   COMPONENT-ID, ACTION, and every odd-indexed entry of ARGS (the value
+   slot of each key/value pair) must be a SAFE-JS-STRING-LITERAL. The
+   producer's safety claim is type-enforced at entry; raw strings
+   signal a TYPE-ERROR. Each value's underlying form is then HTML-
+   attribute-escaped on emit so the JS-quoted body survives parsing
+   inside the surrounding double-quoted attribute."
+  (check-type component-id safe-js-string-literal)
+  (check-type action safe-js-string-literal)
+  (format nil "data-dispatch=\"~A\" data-action=\"~A\"~{~A~}"
+          (lol-web/escape:escape-attribute
+           (safe-js-string-literal-value component-id))
+          (lol-web/escape:escape-attribute
+           (safe-js-string-literal-value action))
           (iter (for (k v) on args by #'cddr)
-            (collect (format nil " data-arg-~a=\"~a\"" k v)))))
+            (check-type v safe-js-string-literal)
+            ;; The key lands in attribute-NAME position (data-arg-<key>), which
+            ;; escape-attribute cannot protect — a name cannot be escaped, only
+            ;; rejected. Confine it to letters/digits/-/_ so it cannot break out
+            ;; of the attribute or inject a second attribute.
+            (let ((key-str (princ-to-string k)))
+              (unless (and (plusp (length key-str))
+                           (every (lambda (c)
+                                    (or (and (char<= #\a c) (char<= c #\z))
+                                        (and (char<= #\A c) (char<= c #\Z))
+                                        (and (char<= #\0 c) (char<= c #\9))
+                                        (char= c #\-)
+                                        (char= c #\_)))
+                                  key-str))
+                (error "hx-dispatch arg key ~S contains characters unsafe for ~
+                        the data-arg-<key> attribute name (letters, digits, ~
+                        `-`, `_` only)." k)))
+            (collect (format nil " data-arg-~A=\"~A\""
+                             k
+                             (lol-web/escape:escape-attribute
+                              (safe-js-string-literal-value v)))))))
 
 (defun hx-bind (component-id state-key)
-  "Generate data attributes for two-way binding."
-  (format nil "data-bind=\"~a\" data-state=\"~a\""
-          component-id state-key))
+  "Generate data attributes for two-way binding.
+
+   COMPONENT-ID and STATE-KEY must both be SAFE-JS-STRING-LITERAL; the
+   producer's safety claim is type-enforced at entry. Underlying forms
+   are HTML-attribute-escaped on emit."
+  (check-type component-id safe-js-string-literal)
+  (check-type state-key safe-js-string-literal)
+  (format nil "data-bind=\"~A\" data-state=\"~A\""
+          (lol-web/escape:escape-attribute
+           (safe-js-string-literal-value component-id))
+          (lol-web/escape:escape-attribute
+           (safe-js-string-literal-value state-key))))

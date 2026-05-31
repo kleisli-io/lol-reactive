@@ -119,6 +119,9 @@
 
    Example:
    (:div (hx-morph \"/api/search\" :target \"#results\" :trigger \"input delay:300ms\"))
-     (:input :type \"text\" :name \"q\"))"
-  (format nil "hx-get=\"~a\"~@[ hx-target=\"~a\"~] hx-swap=\"~a\"~@[ hx-trigger=\"~a\"~]"
-          url target morph-style trigger))
+     (:input :type \"text\" :name \"q\"))
+
+   URL/target/trigger flow through emit-hx-attrs so the URL is scheme-guarded
+   and every value is attribute-escaped — a hostile url/target/trigger cannot
+   break out of the attribute or smuggle a javascript: URL."
+  (emit-hx-attrs "get" url target morph-style trigger))

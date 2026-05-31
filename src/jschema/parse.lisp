@@ -42,6 +42,16 @@
   "Bound during PARSE to the root schema's self-registry hash-table. Each
    descended-into schema is registered under its JSON Pointer.")
 
+(defparameter *max-schema-depth* 256
+  "Hard cap on nested schema construction during PARSE. A schema document
+   whose subschema nesting exceeds this signals INVALID-SCHEMA rather than
+   recursing far enough to blow the parser's call stack. Rebind via let
+   in callers ingesting legitimately deeper documents.")
+
+(defvar *parse-schema-depth* 0
+  "Bound during PARSE; incremented by %make-schema on every recursive
+   descent into a child schema, checked against *max-schema-depth*.")
+
 (defun %tracked-pointer-push (pointer-suffix)
   "Append POINTER-SUFFIX (a string already prefixed with '/') to the current
    tracked pointer. Returns the new full pointer."
@@ -57,12 +67,30 @@
 ;;; INPUT NORMALIZATION
 ;;; ============================================================================
 
+(defparameter *schema-json-max-depth* 128
+  "Cap on object/array nesting depth when decoding a JSON Schema *document*
+   with jzon. The schema-construction guard *max-schema-depth* only fires
+   after jzon has already materialised the whole value, so the parse needs
+   its own bound to refuse a pathologically deep document up front. Pins
+   jzon's implicit default explicitly so the limit is declared at the parse
+   site and tunable via let; symmetric with the request-body path's
+   *json-body-max-depth*.")
+
+(defparameter *schema-json-max-string-length* 1048576
+  "Cap on individual JSON string length (characters) when decoding a JSON
+   Schema document with jzon. Declared explicitly at the parse site,
+   symmetric with the request-body path's *json-body-max-string-length*.")
+
 (defun %parse-json (input allow-comments allow-trailing-comma)
-  "Decode INPUT with jzon. Returns the parsed JSON value."
+  "Decode INPUT with jzon, bounding nesting depth and string length so a
+   hostile schema document is refused before its whole tree is built.
+   Returns the parsed JSON value."
   (handler-case
       (com.inuoe.jzon:parse input
                             :allow-comments allow-comments
-                            :allow-trailing-comma allow-trailing-comma)
+                            :allow-trailing-comma allow-trailing-comma
+                            :max-depth *schema-json-max-depth*
+                            :max-string-length *schema-json-max-string-length*)
     (com.inuoe.jzon:json-error (e)
       (error 'unparsable-json
              :error-message (format nil "Cannot decode JSON Schema: ~A" e)
@@ -109,8 +137,14 @@
 
 (defun %make-schema (json root-p)
   "Build a JSON-SCHEMA from a jzon-parsed JSON value. Registers the result in
-   *SELF-REGISTRY* under the current *PARSE-JSON-POINTER*."
-  (let ((schema
+   *SELF-REGISTRY* under the current *PARSE-JSON-POINTER*. Recursion bounded
+   by *max-schema-depth*."
+  (when (>= *parse-schema-depth* *max-schema-depth*)
+    (raise-invalid-schema
+     "Schema nesting exceeds *max-schema-depth* (~D) — refusing to parse deeper"
+     *max-schema-depth*))
+  (let* ((*parse-schema-depth* (1+ *parse-schema-depth*))
+         (schema
           (cond
             ((eq json t)
              (make-json-schema :bool :true))

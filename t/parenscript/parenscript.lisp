@@ -6,41 +6,51 @@
 ;;; ============================================================================
 
 (test js-value-nil
-  "js-value converts nil to null"
-  (is (string= "null" (lol-web/parenscript::js-value nil))))
+  "js-value tags nil as the JS literal `null`."
+  (let ((v (lol-web/parenscript::js-value nil)))
+    (is (safe-js-string-literal-p v))
+    (is (string= "null" (safe-js-string-literal-value v)))))
 
 (test js-value-numbers
-  "js-value handles integers and floats"
-  (is (string= "42"  (lol-web/parenscript::js-value 42)))
-  (is (string= "0"   (lol-web/parenscript::js-value 0)))
-  (is (string= "-10" (lol-web/parenscript::js-value -10))))
+  "js-value tags numbers as their printed JS form."
+  (is (string= "42"  (safe-js-string-literal-value
+                      (lol-web/parenscript::js-value 42))))
+  (is (string= "0"   (safe-js-string-literal-value
+                      (lol-web/parenscript::js-value 0))))
+  (is (string= "-10" (safe-js-string-literal-value
+                      (lol-web/parenscript::js-value -10)))))
 
 (test js-value-strings
-  "js-value wraps strings in quotes"
-  (let ((result (lol-web/parenscript::js-value "hello")))
-    (is (stringp result))
-    (is (> (length result) (length "hello")))
-    (is (search "hello" result))))
+  "js-value tags strings as single-quoted JS string literals."
+  (let* ((v (lol-web/parenscript::js-value "hello"))
+         (source (safe-js-string-literal-value v)))
+    (is (safe-js-string-literal-p v))
+    (is (> (length source) (length "hello")))
+    (is (search "hello" source))))
 
 (test js-value-symbols
-  "js-value converts symbols to lowercase strings"
-  (let ((result (lol-web/parenscript::js-value 'my-symbol)))
-    (is (stringp result))
-    (is (search "my-symbol" result :test #'char-equal))))
+  "js-value tags symbols as their downcased name in JS literal form."
+  (let ((source (safe-js-string-literal-value
+                 (lol-web/parenscript::js-value 'my-symbol))))
+    (is (search "my-symbol" source :test #'char-equal))))
 
 ;;; ============================================================================
 ;;; Event-handler JS generation
 ;;; ============================================================================
 
-(test on-click-generates-js
-  "on-click generates dispatch JavaScript"
-  (let ((result (on-click "test-comp" '(alert "clicked"))))
+(test on-click-symbol-action-emits-js-string-literal
+  "Symbol action becomes a JS string literal, never a JS identifier."
+  (let ((result (on-click "test-comp" 'fetch-action)))
     (is (stringp result))
-    (is (search "dispatch" result :test #'char-equal))))
+    (is (search "dispatch" result))
+    (is (search "'fetch-action'" result)
+        "symbol action must be emitted as quoted JS string, not bare identifier")))
 
-(test on-change-generates-js
-  "on-change generates setState JavaScript"
+(test on-change-symbol-key-emits-js-string-literal
+  "Symbol state-key becomes a JS string literal, never a JS identifier."
   (let ((result (on-change "test-comp" 'value)))
     (is (stringp result))
-    (is (search "setState" result :test #'char-equal))))
+    (is (search "setState" result :test #'char-equal))
+    (is (search "'value'" result)
+        "symbol state-key must be emitted as quoted JS string, not bare identifier")))
 

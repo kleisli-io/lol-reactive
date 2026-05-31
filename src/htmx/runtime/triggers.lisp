@@ -25,31 +25,53 @@
 
    ;; hx-on-* attribute processing
    ;; Supports: hx-on-click, hx-on-htmx-after-swap, hx-on--after-swap
-   "processHxOn" '(lambda (element)
+   ;;
+   ;; Native DOM events (click/submit/change/...) are bound by writing the
+   ;; native `on<event>' attribute via setAttribute — the browser then
+   ;; compiles the handler under `script-src 'unsafe-inline'' (the same rule
+   ;; that governs `<button onclick="...">' in source HTML). htmx custom
+   ;; events (htmx:afterSwap, etc.) have no native attribute, so they fall
+   ;; back to addEventListener + Function — that path needs `'unsafe-eval''
+   ;; in CSP. We wrap it in try/catch so a strict CSP fails one handler
+   ;; instead of aborting the whole runtime init.
+   ;; The prefix that gates handler lifting is spliced from the canonical
+   ;; lol-web/escape:*hx-on-attribute-prefix*, the same source the server-side
+   ;; sanitize-hx-on-attrs strips on — so the lift set and the scrub set cannot
+   ;; drift (the colon-form gap was exactly such a drift).
+   "processHxOn" `(lambda (element)
                     (let ((attrs (ps:chain -array prototype slice
                                            (call (ps:chain element attributes)))))
                       (ps:chain attrs
                         (for-each
                           (lambda (attr)
                             (let ((name (ps:@ attr name)))
-                              (when (ps:chain name (starts-with "hx-on"))
+                              (when (ps:chain name (starts-with ,lol-web/escape:*hx-on-attribute-prefix*))
                                 (let* ((suffix (ps:chain name (substring 5)))
-                                       (event-name
-                                         (cond
-                                           ;; hx-on--after-swap → htmx:afterSwap
-                                           ((ps:chain suffix (starts-with "--"))
-                                            (+ "htmx:" ((ps:@ *htmx* dash-to-camel)
-                                                         (ps:chain suffix (substring 2)))))
-                                           ;; hx-on-htmx-after-swap → htmx:afterSwap
-                                           ((ps:chain suffix (starts-with "-htmx-"))
-                                            (+ "htmx:" ((ps:@ *htmx* dash-to-camel)
-                                                         (ps:chain suffix (substring 6)))))
-                                           ;; hx-on-click → click
-                                           (t (ps:chain suffix (substring 1)))))
-                                       (code (ps:@ attr value)))
-                                  (ps:chain element
-                                    (add-event-listener event-name
-                                      (ps:new (-Function "event" code))))))))))))
+                                       (code (ps:@ attr value))
+                                       (is-htmx-event
+                                         (or (ps:chain suffix (starts-with "--"))
+                                             (ps:chain suffix (starts-with "-htmx-")))))
+                                  (if is-htmx-event
+                                      (let ((event-name
+                                              (if (ps:chain suffix (starts-with "--"))
+                                                  (+ "htmx:" ((ps:@ *htmx* dash-to-camel)
+                                                              (ps:chain suffix (substring 2))))
+                                                  (+ "htmx:" ((ps:@ *htmx* dash-to-camel)
+                                                              (ps:chain suffix (substring 6)))))))
+                                        (ps:try
+                                          (ps:chain element
+                                            (add-event-listener event-name
+                                              (ps:new (-Function "event" code))))
+                                          (:catch (e)
+                                            (ps:chain console
+                                              (warn "[HTMX] hx-on handler skipped (CSP unsafe-eval needed):"
+                                                    name e)))))
+                                      ;; Native DOM event — let the browser compile
+                                      ;; under inline-attribute CSP. suffix is e.g.
+                                      ;; "-click"; native attribute name is "onclick".
+                                      (let ((dom-attr (+ "on" (ps:chain suffix (substring 1)))))
+                                        (ps:chain element
+                                          (set-attribute dom-attr code))))))))))))
 
    ;; Dispatch a CustomEvent on an element (bubbles up)
    "dispatchEvent" '(lambda (name element detail)

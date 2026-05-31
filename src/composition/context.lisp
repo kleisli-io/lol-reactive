@@ -13,24 +13,31 @@
 (defvar *context-registry* (make-hash-table :test 'eq)
   "Registry of all defined contexts for Surgery introspection.")
 
+(defvar *context-registry-lock*
+  (bordeaux-threads:make-recursive-lock "lol-web context registry")
+  "Serialises context registry reads and writes.")
+
 (defun register-context (name var-name default documentation)
   "Register a context in the global registry."
-  (setf (gethash name *context-registry*)
-        (list :var var-name
-              :default default
-              :documentation documentation)))
+  (bordeaux-threads:with-recursive-lock-held (*context-registry-lock*)
+    (setf (gethash name *context-registry*)
+          (list :var var-name
+                :default default
+                :documentation documentation))))
 
 (defun list-contexts ()
   "List all registered contexts."
-  (let ((contexts nil))
-    (maphash (lambda (name info)
-               (push (list* name info) contexts))
-             *context-registry*)
-    (nreverse contexts)))
+  (bordeaux-threads:with-recursive-lock-held (*context-registry-lock*)
+    (let ((contexts nil))
+      (maphash (lambda (name info)
+                 (push (list* name info) contexts))
+               *context-registry*)
+      (nreverse contexts))))
 
 (defun get-context-info (name)
   "Get info about a registered context."
-  (gethash name *context-registry*))
+  (bordeaux-threads:with-recursive-lock-held (*context-registry-lock*)
+    (gethash name *context-registry*)))
 
 ;;; ============================================================================
 ;;; DEFCONTEXT - Simple Dynamic Variable Context

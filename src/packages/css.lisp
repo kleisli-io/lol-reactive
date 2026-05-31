@@ -26,8 +26,28 @@
    #:css-media
    #:css-var
    #:css-var-definition
+   #:safe-css-selector-p
+   #:safe-css-value-p
+   ;; escape-css-value / escape-css-ident close the declaration/rule/
+   ;; <style>-tag boundary (;}<>), NOT the value-internal url()/string context:
+   ;; `"` `'` `(` `)` pass through by design (escaping them corrupts legitimate
+   ;; framework values — see escape-css-value's RESIDUAL EXPOSURE docstring).
+   ;; The `escape-` prefix names a boundary-escape, not a full sanitiser; do
+   ;; NOT route attacker-controlled values into url()/content/font-family
+   ;; through these alone.
+   #:escape-css-value
+   #:unsafe-css-selector
+   ;; safety.lisp
+   #:safe-css-payload-string
+   #:safe-css-payload-string-p
+   #:safe-css-payload-string-value
+   #:make-safe-css-payload-string
+   #:safe-css-ident-p
+   #:escape-css-ident
+   #:unsafe-css-ident
    ;; tokens.lisp
    #:*colors*
+   #:*light-colors*
    #:*typography*
    #:*spacing*
    #:*effects*
@@ -40,6 +60,7 @@
    #:get-spacing
    #:get-effect
    #:validate-token
+   #:*validate-token-max-length*
    #:levenshtein-distance
    #:find-closest-match
    #:generate-css-variables
@@ -55,4 +76,10 @@
    #:tw-border-value
    #:classes
    #:null-or-empty-p
-   #:tailwind-config))
+   #:tailwind-config
+   #:*tailwind-config-max-tokens*
+   #:tailwind-config-token-invalid
+   #:tailwind-config-token-invalid-key
+   #:tailwind-config-too-many-tokens
+   #:tailwind-config-too-many-tokens-count
+   #:tailwind-config-too-many-tokens-limit))

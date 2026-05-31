@@ -7,5 +7,12 @@
 (defpackage :lol-web/resources
   (:use :cl :iterate
         :lol-web/html)   ; htm-str
+  (:import-from :lol-web/css
+                #:classes
+                #:css-keyframes
+                #:css-rule
+                #:css-section
+                #:css-var
+                #:make-safe-css-payload-string)
   (:import-from :let-over-lambda :symb)
   (:export))

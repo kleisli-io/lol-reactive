@@ -4,7 +4,8 @@
                 #:def-suite
                 #:in-suite
                 #:test
-                #:is)
+                #:is
+                #:signals)
   (:export
    #:run-tests))
 

@@ -21,9 +21,7 @@
             :extractor-name (extractor-spec-name spec)
             :extractor-kind (extractor-spec-kind spec)
             :raw-value raw
-            :target-type target-type
-            :body (format nil "Unsupported coercion target type ~S for extractor ~S."
-                          target-type (extractor-spec-name spec))))))
+            :target-type target-type))))
 
 (defun %coerce-integer (raw spec)
   "Parse RAW as an integer. Accepts already-INTEGER values (e.g. from
@@ -58,42 +56,45 @@
     (t (%signal-coercion raw 'boolean spec))))
 
 (defun %coerce-keyword (raw spec)
-  "Coerce RAW to a keyword. Accepts existing KEYWORDS unchanged. Strings
-   are upcased and interned into the keyword package. Empty strings fail —
-   a missing-input should have been caught earlier in RESOLVE-EXTRACTOR's
-   required-p check; reaching coercion with an empty string means the
-   source literally contained an empty value, which is not a valid keyword."
+  "Coerce RAW to a keyword via SAFE-COERCE-KEYWORD (FIND-SYMBOL against
+   :keyword). RAW must already name an interned keyword; otherwise the
+   request fails as EXTRACTOR-COERCION-ERROR (400). Empty strings fail —
+   RESOLVE-EXTRACTOR's required-p check catches missing input; an empty
+   string reaching coercion is not a valid keyword."
   (cond
     ((keywordp raw) raw)
     ((stringp raw)
      (let ((trimmed (string-trim '(#\Space #\Tab) raw)))
        (when (zerop (length trimmed))
          (%signal-coercion raw 'keyword spec))
-       (intern (string-upcase trimmed) :keyword)))
+       (or (safe-coerce-keyword trimmed)
+           (%signal-coercion raw 'keyword spec))))
     (t (%signal-coercion raw 'keyword spec))))
 
 (defun %coerce-symbol (raw spec)
-  "Coerce RAW to a symbol. Accepts existing symbols unchanged. Strings are
-   upcased and interned into the keyword package — same shape as
-   %COERCE-KEYWORD; the distinction matters at OpenAPI emission time, not
-   at runtime. Kept separate so user code that types its parameters as
-   SYMBOL vs KEYWORD reads naturally."
+  "Coerce RAW to a symbol. A symbol RAW passes through unchanged; a string
+   RAW resolves via SAFE-COERCE-KEYWORD against the keyword package, so the
+   result is always a KEYWORD. Keywords satisfy SYMBOLP, so the SYMBOL type
+   contract holds, but a string-typed :symbol parameter never yields a
+   non-keyword symbol — callers needing that distinction must inspect the
+   value, not assume the package. Resolution is FIND-SYMBOL-bounded (never
+   INTERN), so hostile input cannot grow the symbol pool; the SYMBOL vs
+   KEYWORD label is an OpenAPI-emission distinction, not a runtime one."
   (cond
     ((symbolp raw) raw)
     ((stringp raw)
      (let ((trimmed (string-trim '(#\Space #\Tab) raw)))
        (when (zerop (length trimmed))
          (%signal-coercion raw 'symbol spec))
-       (intern (string-upcase trimmed) :keyword)))
+       (or (safe-coerce-keyword trimmed)
+           (%signal-coercion raw 'symbol spec))))
     (t (%signal-coercion raw 'symbol spec))))
 
 (defun %signal-coercion (raw target-type spec)
+  ;; No :body — the generic default keeps RAW out of the wire response; the
+  ;; condition REPORT formats RAW + extractor identity for server logs.
   (error 'extractor-coercion-error
          :extractor-name (extractor-spec-name spec)
          :extractor-kind (extractor-spec-kind spec)
          :raw-value raw
-         :target-type target-type
-         :body (format nil "Cannot coerce ~S to ~A for ~A extractor ~S."
-                       raw target-type
-                       (extractor-spec-kind spec)
-                       (extractor-spec-name spec))))
+         :target-type target-type))

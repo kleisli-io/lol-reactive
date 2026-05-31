@@ -131,3 +131,12 @@
   (let ((store (make-store '((x . 100)))))
     (let ((inspection (funcall store :inspect)))
       (is (listp inspection)))))
+
+(test regression-pandoric-signal-nil-history-uses-default-limit
+  "Passing :max-history NIL does not create an unbounded history."
+  (let ((lol-web/core::*max-signal-history* 3))
+    (let ((signal (make-pandoric-signal :bounded nil :max-history nil)))
+      (dotimes (i 10)
+        (funcall signal :set i))
+      (is (= 3 (length (funcall signal :history))))
+      (is (= 3 (getf (funcall signal :inspect) :history-limit))))))

@@ -15,12 +15,28 @@
 
 (defun surgery-runtime-js ()
   "Generate the client-side surgery runtime JavaScript via Parenscript.
-   NO hardcoded colors - all styling uses CSS variables from tokens."
+   NO hardcoded colors - all styling uses CSS variables from tokens.
+
+   Every fetch routes through `csrf-headers' which reads the current
+   `<meta name=\"csrf-token\">' tag at call time. CSRF rotation is
+   picked up without a panel rebuild; deployments that ship CSRF on
+   keep the panel working without operators having to disable CSRF."
   (parenscript:ps
     ;; Get CSS variable value at runtime
     (defun get-css-var (name)
       (ps:chain (get-computed-style (ps:@ document document-element))
              (get-property-value name)))
+
+    ;; Read the current CSRF token from the page meta tag. Returns the
+    ;; empty string when no tag is present so the header is always set,
+    ;; never undefined — server rejects empty tokens upstream.
+    (defun csrf-token ()
+      (let ((tag (ps:chain document (query-selector "meta[name=\"csrf-token\"]"))))
+        (if (and tag (ps:@ tag content)) (ps:@ tag content) "")))
+
+    (defun csrf-headers ()
+      (ps:create "Content-Type" "application/json"
+                 "X-CSRF-Token" (csrf-token)))
 
     ;; Surgery Runtime - X-ray inspection and live modification
     (defvar *surgery*
@@ -73,7 +89,7 @@
            (ps:chain
             (fetch "/api/surgery/state"
                    (ps:create :method "POST"
-                              :headers (ps:create "Content-Type" "application/json")
+                              :headers (csrf-headers)
                               :body (ps:chain -j-s-o-n (stringify
                                      (ps:create :component-id component-id)))))
             (then (lambda (r) (ps:chain r (json))))
@@ -126,7 +142,7 @@
            (ps:chain
             (fetch "/api/surgery/update"
                    (ps:create :method "POST"
-                              :headers (ps:create "Content-Type" "application/json")
+                              :headers (csrf-headers)
                               :body (ps:chain -j-s-o-n (stringify
                                      (ps:create :component-id component-id
                                                 :key key
@@ -144,55 +160,6 @@
                     ;; Flash effect to show change
                     (ps:chain self (flash-component component-id)))))))
 
-       ;; Eval Lisp form in component context
-       :eval-in-context
-       (lambda (component-id)
-         (let ((input (ps:chain document (get-element-by-id (+ "repl-input-" component-id))))
-               (output (ps:chain document (get-element-by-id (+ "repl-output-" component-id))))
-               (self this))
-           (let ((form (ps:chain (ps:@ input value) (trim))))
-             (when form
-               ;; Add to output
-               (let ((prompt-el (ps:chain document (create-element "div"))))
-                 (setf (ps:@ prompt-el class-name) "text-primary")
-                 (setf (ps:@ prompt-el text-content) (+ "> " form))
-                 (ps:chain output (append-child prompt-el)))
-               (ps:chain
-                (fetch "/api/surgery/eval"
-                       (ps:create :method "POST"
-                                  :headers (ps:create "Content-Type" "application/json")
-                                  :body (ps:chain -j-s-o-n (stringify
-                                         (ps:create :component-id component-id
-                                                    :form form)))))
-                (then (lambda (r) (ps:chain r (json))))
-                (then (lambda (data)
-                        (let ((result (ps:chain document (create-element "div"))))
-                          (if (ps:@ data success)
-                              (progn
-                                (setf (ps:@ result class-name) "text-secondary pl-2")
-                                (setf (ps:@ result text-content) (+ "=> " (ps:@ data result)))
-                                ;; Re-render component if state changed
-                                (when (ps:@ data html)
-                                  (let ((wrapper (ps:chain document (query-selector
-                                                  (+ "[data-component-id=\"" component-id "\"] .xray-content")))))
-                                    (when wrapper
-                                      (setf (ps:@ wrapper inner-h-t-m-l) (ps:@ data html))))))
-                              (progn
-                                (setf (ps:@ result class-name) "text-error pl-2")
-                                (setf (ps:@ result text-content) (+ "ERROR: " (ps:@ data error)))))
-                          (ps:chain output (append-child result))
-                          ;; Scroll to bottom
-                          (setf (ps:@ output scroll-top) (ps:@ output scroll-height))
-                          ;; Clear input
-                          (setf (ps:@ input value) "")
-                          ;; Refresh state display
-                          (ps:chain self (refresh-state component-id)))))
-                (catch (lambda (e)
-                         (let ((error-el (ps:chain document (create-element "div"))))
-                           (setf (ps:@ error-el class-name) "text-error pl-2")
-                           (setf (ps:@ error-el text-content) (+ "ERROR: " (ps:@ e message)))
-                           (ps:chain output (append-child error-el))))))))))
-
        ;; Capture snapshot
        :capture-snapshot
        (lambda (component-id)
@@ -201,7 +168,7 @@
            (ps:chain
             (fetch "/api/surgery/snapshot"
                    (ps:create :method "POST"
-                              :headers (ps:create "Content-Type" "application/json")
+                              :headers (csrf-headers)
                               :body (ps:chain -j-s-o-n (stringify
                                      (ps:create :component-id component-id
                                                 :action "capture"
@@ -220,7 +187,7 @@
            (ps:chain
             (fetch "/api/surgery/snapshot"
                    (ps:create :method "POST"
-                              :headers (ps:create "Content-Type" "application/json")
+                              :headers (csrf-headers)
                               :body (ps:chain -j-s-o-n (stringify
                                      (ps:create :component-id component-id
                                                 :action "restore"
@@ -244,7 +211,7 @@
          (ps:chain
           (fetch "/api/surgery/panel"
                  (ps:create :method "POST"
-                            :headers (ps:create "Content-Type" "application/json")
+                            :headers (csrf-headers)
                             :body (ps:chain -j-s-o-n (stringify
                                    (ps:create :component-id component-id)))))
           (then (lambda (r) (ps:chain r (json))))
@@ -287,7 +254,7 @@
          (ps:chain
           (fetch "/api/surgery/state"
                  (ps:create :method "POST"
-                            :headers (ps:create "Content-Type" "application/json")
+                            :headers (csrf-headers)
                             :body (ps:chain -j-s-o-n (stringify
                                    (ps:create :component-id component-id)))))
           (then (lambda (r) (ps:chain r (json))))
@@ -305,7 +272,7 @@
            (ps:chain
             (fetch "/api/surgery/undo"
                    (ps:create :method "POST"
-                              :headers (ps:create "Content-Type" "application/json")
+                              :headers (csrf-headers)
                               :body (ps:chain -j-s-o-n (stringify
                                      (ps:create :component-id component-id)))))
             (then (lambda (r) (ps:chain r (json))))
@@ -324,7 +291,7 @@
            (ps:chain
             (fetch "/api/surgery/redo"
                    (ps:create :method "POST"
-                              :headers (ps:create "Content-Type" "application/json")
+                              :headers (csrf-headers)
                               :body (ps:chain -j-s-o-n (stringify
                                      (ps:create :component-id component-id)))))
             (then (lambda (r) (ps:chain r (json))))
@@ -340,7 +307,6 @@
     (defun toggle-xray (id) (ps:chain *surgery* (toggle-xray id)))
     (defun close-xray (id) (ps:chain *surgery* (close-xray id)))
     (defun edit-state (id key) (ps:chain *surgery* (edit-state id key)))
-    (defun eval-in-context (id) (ps:chain *surgery* (eval-in-context id)))
     (defun capture-snapshot (id) (ps:chain *surgery* (capture-snapshot id)))
     (defun restore-snapshot (id ts) (ps:chain *surgery* (restore-snapshot id ts)))
     (defun inspect-component (id) (ps:chain *surgery* (inspect-component id)))

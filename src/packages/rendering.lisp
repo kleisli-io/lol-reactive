@@ -6,6 +6,7 @@
 
 (defpackage :lol-web/rendering
   (:use :cl :iterate
+        :lol-web/core
         :lol-web/html)   ; htm-str
   (:import-from :let-over-lambda :defmacro!)
   (:export))

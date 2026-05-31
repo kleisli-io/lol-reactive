@@ -13,9 +13,34 @@
 ;;; ═══════════════════════════════════════════════════════════════════════════
 
 (defvar *debug-mode* nil
-  "When T, show full backtraces in error responses and log detailed info.")
+  "When T, show full backtraces in error responses and log detailed info.
+   Image-global by design — error rendering is a process-wide policy.
+   Mutated through SET-DEBUG-MODE / ENABLE-DEBUG-MODE / DISABLE-DEBUG-MODE;
+   freeze the value at boot with LOCK-DEBUG-MODE so later writes signal.")
 
-(defvar *error-log-path* "/tmp/lol-reactive-error.log"
+(defvar *debug-mode-locked-p* nil
+  "When T, subsequent writes through the SET-DEBUG-MODE gate signal
+   DEBUG-MODE-LOCKED-ERROR. One-way: cannot be unlocked. Engaged by
+   LOCK-DEBUG-MODE or by make-app's :LOCK-DEBUG-MODE-P kwarg.")
+
+(define-condition debug-mode-locked-error (error)
+  ((value :initarg :value :reader debug-mode-locked-error-value))
+  (:report
+   (lambda (c s)
+     (format s "*debug-mode* is locked; refusing to set to ~S."
+             (debug-mode-locked-error-value c)))))
+
+(defun %default-error-log-path ()
+  (let* ((cache-root (or (uiop:getenv "XDG_CACHE_HOME")
+                         (let ((home (user-homedir-pathname)))
+                           (when home
+                             (namestring (merge-pathnames ".cache/" home)))))))
+    (when cache-root
+      (namestring
+       (merge-pathnames "lol-web/error.log"
+                        (uiop:ensure-directory-pathname cache-root))))))
+
+(defvar *error-log-path* (%default-error-log-path)
   "Path to error log file. Set to NIL to disable file logging.")
 
 ;;; ═══════════════════════════════════════════════════════════════════════════
@@ -51,6 +76,7 @@
   ;; File logging (always, if path configured)
   (when *error-log-path*
     (ignore-errors
+      (ensure-directories-exist *error-log-path*)
       (with-open-file (log-stream *error-log-path*
                                   :direction :output
                                   :if-exists :append
@@ -126,13 +152,20 @@ pre {
 (defun render-error-page (error &key (context "Unknown"))
   "Render a user-friendly error page.
    In debug mode, shows error details. Otherwise, shows generic message.
-   Uses minimal HTML as fallback if complex rendering fails."
+   Uses minimal HTML as fallback if complex rendering fails.
+
+   CONTEXT and the printed form of ERROR can carry attacker-influenced
+   text (request paths, condition bodies, extractor coercion-error
+   messages); both are routed through escape-html before format inserts
+   them into the page so a `<script>` payload renders as literal text."
   (if *debug-mode*
       (minimal-error-html
        "Error"
        "Something went wrong"
-       (format nil "Context: ~A" context)
-       (format nil "~A~%~%Type: ~A" error (type-of error)))
+       (format nil "Context: ~A" (escape-html (princ-to-string context)))
+       (format nil "~A~%~%Type: ~A"
+               (escape-html (princ-to-string error))
+               (escape-html (princ-to-string (type-of error)))))
       (minimal-error-html
        "Error"
        "Something went wrong"
@@ -191,22 +224,26 @@ pre {
 ;;; ═══════════════════════════════════════════════════════════════════════════
 
 (defun render-404-page (&optional path)
-  "Render custom 404 Not Found page."
+  "Render custom 404 Not Found page. PATH is request-controlled and
+   routed through escape-html before format inserts it into the page."
   (minimal-error-html
    "404 - Not Found"
    "404"
    (if path
-       (format nil "The page '~A' doesn't exist." path)
+       (format nil "The page '~A' doesn't exist."
+               (escape-html (princ-to-string path)))
        "The page you're looking for doesn't exist.")))
 
 (defun render-500-page (&optional error)
-  "Render custom 500 Internal Server Error page."
+  "Render custom 500 Internal Server Error page. ERROR's printed form
+   can carry attacker-influenced text; it is escape-html'd before
+   format inserts it into the debug pane."
   (if (and *debug-mode* error)
       (minimal-error-html
        "500 - Server Error"
        "500"
        "Something went wrong on our end."
-       (format nil "~A" error))
+       (escape-html (princ-to-string error)))
       (minimal-error-html
        "500 - Server Error"
        "500"
@@ -216,12 +253,24 @@ pre {
 ;;; Debug Mode Control
 ;;; ═══════════════════════════════════════════════════════════════════════════
 
+(defun set-debug-mode (value)
+  "Set *debug-mode* to VALUE through the production-lock gate. Signals
+   DEBUG-MODE-LOCKED-ERROR when *debug-mode-locked-p* is T."
+  (when *debug-mode-locked-p*
+    (error 'debug-mode-locked-error :value value))
+  (setf *debug-mode* value))
+
+(defun lock-debug-mode ()
+  "Engage the one-way lock on *debug-mode*. Subsequent SET-DEBUG-MODE
+   (including ENABLE/DISABLE-DEBUG-MODE) signal DEBUG-MODE-LOCKED-ERROR."
+  (setf *debug-mode-locked-p* t))
+
 (defun enable-debug-mode ()
   "Enable debug mode - shows detailed errors, backtraces in responses."
-  (setf *debug-mode* t)
+  (set-debug-mode t)
   (format t "LOL-REACTIVE debug mode enabled~%"))
 
 (defun disable-debug-mode ()
   "Disable debug mode - shows minimal error info to users."
-  (setf *debug-mode* nil)
+  (set-debug-mode nil)
   (format t "LOL-REACTIVE debug mode disabled~%"))

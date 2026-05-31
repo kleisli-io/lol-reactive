@@ -8,7 +8,7 @@
    error if any suite has at least one failed assertion so the buildLisp
    test phase fails the umbrella derivation."
   (let ((failed-suites '()))
-    (dolist (suite '(:lol-web/sanitize/test
+    (dolist (suite '(:lol-web/escape/test
                      :lol-web/core/test
                      :lol-web/css/test
                      :lol-web/rendering/test

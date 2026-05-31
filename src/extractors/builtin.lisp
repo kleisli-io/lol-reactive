@@ -30,13 +30,11 @@
     ((null raw)
      (cond
        ((extractor-spec-required-p spec)
+        ;; No :body — the generic default avoids naming the extractor on the
+        ;; wire; the condition REPORT carries kind+name for server logs.
         (error 'missing-extractor-input
                :extractor-name (extractor-spec-name spec)
-               :extractor-kind (extractor-spec-kind spec)
-               :body (format nil "Missing required ~(~A~) parameter ~S."
-                             (extractor-spec-kind spec)
-                             (or (extractor-spec-source-string spec)
-                                 (extractor-spec-name spec)))))
+               :extractor-kind (extractor-spec-kind spec)))
        ((extractor-spec-default spec)
         (funcall (extractor-spec-default spec)))
        (t nil)))

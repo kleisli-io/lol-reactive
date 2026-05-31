@@ -94,29 +94,61 @@
 ;;; KEYED RENDER - Render with Key Tracking
 ;;; ============================================================================
 
-(defvar *rendered-lists* (make-hash-table :test 'equal)
-  "Cache of rendered keyed lists for diffing.")
+(defvar *rendered-lists* (make-bounded-cache :max-entries 1024 :test 'equal)
+  "Default bounded cache of rendered keyed lists for diffing. Image-global;
+   pass :CACHE to KEYED-RENDER / CLEAR-LIST-CACHE / INSPECT-LIST-CACHE to use
+   a caller-owned cache for per-app or per-test isolation.")
 
-(defun keyed-render (list-id items key-fn render-fn)
+(defun %cache-get (cache key)
+  (etypecase cache
+    (hash-table (gethash key cache))
+    (bounded-cache (bounded-cache-get cache key))))
+
+(defun %cache-set (cache key value)
+  (etypecase cache
+    (hash-table (setf (gethash key cache) value))
+    (bounded-cache (bounded-cache-set cache key value))))
+
+(defun %cache-remove (cache key)
+  (etypecase cache
+    (hash-table (remhash key cache))
+    (bounded-cache (bounded-cache-remove cache key))))
+
+(defun %cache-clear (cache)
+  (etypecase cache
+    (hash-table (clrhash cache))
+    (bounded-cache (bounded-cache-clear cache))))
+
+(defun %cache-map (fn cache)
+  (etypecase cache
+    (hash-table (maphash fn cache))
+    (bounded-cache
+     (dolist (key (bounded-cache-keys cache))
+       (multiple-value-bind (value present-p) (bounded-cache-get cache key)
+         (when present-p
+           (funcall fn key value)))))))
+
+(defun keyed-render (list-id items key-fn render-fn
+                     &key (cache *rendered-lists*))
   "Render items with key tracking and return diff operations.
 
    LIST-ID: Unique identifier for this list
    ITEMS: List of items to render
    KEY-FN: Function to extract key from item
    RENDER-FN: Function to render item to HTML string
+   CACHE: hash-table or bounded-cache for prior-render lookup; defaults to
+   *RENDERED-LISTS*.
 
    Returns (values html-string operations) where operations
    can be applied incrementally on the client."
-  (let* ((old-rendered (gethash list-id *rendered-lists*))
+  (let* ((old-rendered (%cache-get cache list-id))
          (new-rendered (mapcar (lambda (item)
                                  (cons (funcall key-fn item)
                                        (funcall render-fn item)))
                                items))
          (ops (when old-rendered
                 (reconcile-rendered-list old-rendered new-rendered))))
-    ;; Update cache
-    (setf (gethash list-id *rendered-lists*) new-rendered)
-    ;; Return full HTML and operations
+    (%cache-set cache list-id new-rendered)
     (values (format nil "~{~A~}" (mapcar #'cdr new-rendered))
             ops)))
 
@@ -160,24 +192,24 @@
 ;;; CLEAR-LIST-CACHE
 ;;; ============================================================================
 
-(defun clear-list-cache (&optional list-id)
-  "Clear the rendered list cache.
-   If LIST-ID provided, clear only that list."
+(defun clear-list-cache (&optional list-id (cache *rendered-lists*))
+  "Clear rendered-list entries from CACHE (defaults to *RENDERED-LISTS*).
+   If LIST-ID provided, clear only that entry; otherwise CLRHASH CACHE."
   (if list-id
-      (remhash list-id *rendered-lists*)
-      (clrhash *rendered-lists*)))
+      (%cache-remove cache list-id)
+      (%cache-clear cache)))
 
 ;;; ============================================================================
 ;;; INSPECTION
 ;;; ============================================================================
 
-(defun inspect-list-cache ()
-  "Return info about cached rendered lists."
+(defun inspect-list-cache (&optional (cache *rendered-lists*))
+  "Return info about cached rendered lists in CACHE."
   (let ((lists nil))
-    (maphash (lambda (id rendered)
-               (push (list :id id
-                           :count (length rendered)
-                           :keys (mapcar #'car rendered))
-                     lists))
-             *rendered-lists*)
+    (%cache-map (lambda (id rendered)
+                  (push (list :id id
+                              :count (length rendered)
+                              :keys (mapcar #'car rendered))
+                        lists))
+                cache)
     lists))

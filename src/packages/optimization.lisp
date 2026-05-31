@@ -32,4 +32,5 @@
    #:*registered-css-prefixes*
    #:register-css-class
    #:register-css-prefix
-   #:register-tailwind-classes))
+   #:register-tailwind-classes
+   #:lint-hx-on-not-literal))

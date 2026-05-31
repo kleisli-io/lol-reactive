@@ -32,7 +32,15 @@ let
   ## Sub-systems that have any test files. Used to gate per-sub-system test
   ## defsystems and the umbrella test's :depends-on list.
   subsystemsWithTests =
-    builtins.filter (n: table.modules.${n}.test-srcs != []) table.load-order;
+    builtins.filter (n: table.modules.${n}.test-srcs != [ ]) table.load-order;
+
+  ## Sub-systems pulled in by the umbrella's :depends-on. Modules flagged
+  ## opt-in are still defined as standalone ASDF systems (and still have
+  ## their own test system included in :lol-web/test), but are not pulled
+  ## by (asdf:load-system :lol-web). Consumers that want them load the
+  ## sub-system explicitly.
+  umbrellaModules =
+    builtins.filter (n: !(table.modules.${n}.opt-in or false)) table.load-order;
 
   ## Emit one ASDF defsystem form per sub-system, with focused :depends-on
   ## (internal-deps as sibling lol-web/<n> systems, external-deps mapped to
@@ -44,7 +52,8 @@ let
         map subsystemName cfg.internal-deps
         ++ map asdfNameOf cfg.external-deps;
       components = [ cfg.package-src ] ++ cfg.srcs;
-    in ''
+    in
+    ''
       (defsystem "${subsystemName name}"
         :depends-on (${joinIndented (map quoted depsList)})
         :pathname "."
@@ -59,10 +68,11 @@ let
   subsystemTestDefsystem = name:
     let
       cfg = table.modules.${name};
-      testInternal = cfg.test-internal-deps or [];
+      testInternal = cfg.test-internal-deps or [ ];
       depsList = [ (subsystemName name) "fiveam" ]
-              ++ map subsystemName testInternal;
-    in ''
+        ++ map subsystemName testInternal;
+    in
+    ''
       (defsystem "${subsystemTestName name}"
         :depends-on (${joinIndented (map quoted depsList)})
         :pathname "."
@@ -72,7 +82,7 @@ let
                    (uiop:symbol-call :${subsystemTestName name} :run-tests)))
     '';
 
-  ## The umbrella system depends on every sub-system in load-order and only
+  ## The umbrella system depends on every non-opt-in sub-system and only
   ## compiles the umbrella file (src/package.lisp), which defines :lol-web
   ## and the :lol-reactive shim. Sub-system load order is enforced by ASDF
   ## walking the :depends-on list in order.
@@ -80,7 +90,7 @@ let
     (defsystem "lol-web"
       :description "Reactive web framework using Let Over Lambda patterns."
       :license "MIT"
-      :depends-on (${joinIndented (map (n: quoted (subsystemName n)) table.load-order)})
+      :depends-on (${joinIndented (map (n: quoted (subsystemName n)) umbrellaModules)})
       :pathname "."
       :serial t
       :components (${fileComponent table.umbrella-src})

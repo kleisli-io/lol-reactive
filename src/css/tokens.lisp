@@ -45,6 +45,12 @@
                         cost))))))
     (aref matrix len1 len2)))
 
+(defparameter *validate-token-max-length* 256
+  "Maximum allowed symbol-name length for a token passed to
+   `validate-token`. Caps the O(n*m) Levenshtein cost of the suggestion
+   path: an attacker who can force lookups of arbitrarily long tokens
+   would otherwise force quadratic work per request.")
+
 (defun find-closest-match (token alist)
   "Find the closest matching token from alist using Levenshtein distance.
    Returns the keyword with the smallest edit distance."
@@ -67,10 +73,20 @@
    - token: Keyword to validate
    - alist: Valid (keyword . value) pairs
    - token-type-name: Human-readable name for errors
+
+   Tokens whose `symbol-name` exceeds `*validate-token-max-length*` are
+   rejected with a length-error before the suggestion path runs;
+   Levenshtein is quadratic in the token-name length and would
+   otherwise be a DoS surface for caller-controlled keywords.
+
    Returns token if valid, signals descriptive error if invalid."
   (unless (keywordp token)
     (error "~A token must be a keyword, got ~A of type ~A"
            token-type-name token (type-of token)))
+  (when (> (length (symbol-name token)) *validate-token-max-length*)
+    (error "~A token exceeds maximum length (~D > ~D chars)"
+           token-type-name (length (symbol-name token))
+           *validate-token-max-length*))
   (let ((valid-entry (assoc token alist)))
     (unless valid-entry
       (let ((closest (find-closest-match token alist)))
@@ -185,6 +201,14 @@
 (defparameter *colors* (copy-alist *default-colors*)
   "Active color tokens. Override per-application or rebind per-request.")
 
+(defparameter *light-colors* nil
+  "Optional light-palette color tokens. When non-nil,
+   `generate-css-variables` emits a second `[data-theme='light']` block
+   alongside the dark `:root` block, and adds `color-scheme` declarations
+   so the browser auto-styles form controls and scrollbars per palette.
+   Nil (default) preserves single-palette emission for apps that don't
+   ship a theme toggle.")
+
 (defparameter *typography* (copy-alist *default-typography*)
   "Active typography tokens.")
 
@@ -230,28 +254,58 @@
 ;;; CSS Variable Generation
 ;;; ─────────────────────────────────────────────────────────────────────────────
 
+(defun %assert-safe-css-var-name (prefix name)
+  "Reject NAME whose `PREFIX-NAME` segment is not a safe CSS identifier,
+   blocking metacharacter injection into the `--PREFIX-NAME` declaration.
+   Validates the prefixed segment so numeric token names (e.g. spacing
+   `:4` → `space-4`) pass while bare leading-digit names would not."
+  (unless (safe-css-ident-p (concatenate 'string prefix "-" name))
+    (error 'unsafe-css-ident :ident name))
+  name)
+
 (defun generate-css-variables (&key (colors *colors*)
+                                    (light-colors *light-colors*)
                                     (typography *typography*)
                                     (spacing *spacing*)
                                     (effects *effects*))
   "Generate :root CSS variables from token sets.
-   Returns a CSS string for embedding in <style> tags."
+   Returns a CSS string for embedding in <style> tags.
+   When LIGHT-COLORS is non-nil, emits a second block selected by
+   `[data-theme='light']:root, :root[data-theme='light']` whose
+   --color-* values come from LIGHT-COLORS. Dark block carries
+   `color-scheme: dark`; the light block, `color-scheme: light`.
+   Typography/spacing/effects emit once in the dark block — they are
+   not palette-dependent."
   (with-output-to-string (out)
     (format out ":root {~%")
+    (when light-colors
+      (format out "  color-scheme: dark;~%"))
     ;; Colors
     (iter (for (key . value) in colors)
-      (format out "  --color-~A: ~A;~%"
-              (string-downcase (symbol-name key)) value))
+      (let ((name (string-downcase (symbol-name key))))
+        (%assert-safe-css-var-name "color" name)
+        (format out "  --color-~A: ~A;~%" name (escape-css-value value))))
     ;; Typography
     (iter (for (key . value) in typography)
-      (format out "  --font-~A: ~A;~%"
-              (string-downcase (symbol-name key)) value))
+      (let ((name (string-downcase (symbol-name key))))
+        (%assert-safe-css-var-name "font" name)
+        (format out "  --font-~A: ~A;~%" name (escape-css-value value))))
     ;; Spacing
     (iter (for (key . value) in spacing)
-      (format out "  --space-~A: ~A;~%"
-              (string-downcase (symbol-name key)) value))
+      (let ((name (string-downcase (symbol-name key))))
+        (%assert-safe-css-var-name "space" name)
+        (format out "  --space-~A: ~A;~%" name (escape-css-value value))))
     ;; Effects
     (iter (for (key . value) in effects)
-      (format out "  --effect-~A: ~A;~%"
-              (string-downcase (symbol-name key)) value))
-    (format out "}~%")))
+      (let ((name (string-downcase (symbol-name key))))
+        (%assert-safe-css-var-name "effect" name)
+        (format out "  --effect-~A: ~A;~%" name (escape-css-value value))))
+    (format out "}~%")
+    (when light-colors
+      (format out "[data-theme='light']:root,~%:root[data-theme='light'] {~%")
+      (format out "  color-scheme: light;~%")
+      (iter (for (key . value) in light-colors)
+        (let ((name (string-downcase (symbol-name key))))
+          (%assert-safe-css-var-name "color" name)
+          (format out "  --color-~A: ~A;~%" name (escape-css-value value))))
+      (format out "}~%"))))

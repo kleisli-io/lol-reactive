@@ -1,16 +1,34 @@
 {
   modules = {
-    sanitize = {
-      package-src = "src/packages/sanitize.lisp";
+    escape = {
+      package-src = "src/packages/escape.lisp";
       srcs = [
-        "src/sanitize/sanitize.lisp"
+        "src/escape/escape.lisp"
       ];
-      internal-deps = [];
+      internal-deps = [ ];
       external-deps = [ "iterate" "cl-ppcre" ];
       test-srcs = [
-        "t/sanitize/package.lisp"
-        "t/sanitize/suite.lisp"
-        "t/sanitize/sanitize.lisp"
+        "t/escape/package.lisp"
+        "t/escape/suite.lisp"
+        "t/escape/escape.lisp"
+      ];
+    };
+
+    crypto = {
+      package-src = "src/packages/crypto.lisp";
+      srcs = [
+        "src/crypto/util.lisp"
+        "src/crypto/password.lisp"
+        "src/crypto/token.lisp"
+      ];
+      internal-deps = [ ];
+      external-deps = [ "ironclad" "babel" ];
+      test-srcs = [
+        "t/crypto/package.lisp"
+        "t/crypto/suite.lisp"
+        "t/crypto/util.lisp"
+        "t/crypto/password.lisp"
+        "t/crypto/token.lisp"
       ];
     };
 
@@ -21,11 +39,13 @@
         "src/core/signals.lisp"
         "src/core/state.lisp"
         "src/core/collections.lisp"
+        "src/core/bounded-cache.lisp"
+        "src/core/cycle-safe-printer.lisp"
         "src/composition/props.lisp"
         "src/composition/context.lisp"
         "src/composition/children.lisp"
       ];
-      internal-deps = [];
+      internal-deps = [ "crypto" ];
       external-deps = [ "iterate" "let-over-lambda" "bordeaux-threads" "alexandria" ];
       test-srcs = [
         "t/core/package.lisp"
@@ -40,14 +60,17 @@
     css = {
       package-src = "src/packages/css.lisp";
       srcs = [
-        ## generation.lisp must load before registry.lisp so make-css-module's
-        ## :render closure can resolve css-rule / css-keyframes.
+        ## safety.lisp defines safe-css-payload-string and safe-css-ident-p
+        ## which generation.lisp references. generation.lisp must load
+        ## before registry.lisp so make-css-module's :render closure can
+        ## resolve css-rule / css-keyframes.
+        "src/css/safety.lisp"
         "src/css/generation.lisp"
         "src/css/registry.lisp"
         "src/css/tokens.lisp"
         "src/css/tailwind.lisp"
       ];
-      internal-deps = [];
+      internal-deps = [ ];
       external-deps = [ "iterate" "alexandria" "parenscript" "bordeaux-threads" ];
       test-srcs = [
         "t/css/package.lisp"
@@ -62,9 +85,10 @@
     parenscript = {
       package-src = "src/packages/parenscript.lisp";
       srcs = [
+        "src/client/safety.lisp"
         "src/client/parenscript.lisp"
       ];
-      internal-deps = [];
+      internal-deps = [ "escape" ];
       external-deps = [ "iterate" "let-over-lambda" "parenscript" "cl-who" ];
       test-srcs = [
         "t/parenscript/package.lisp"
@@ -79,9 +103,10 @@
       srcs = [
         "src/html/elements.lisp"
         "src/html/page.lisp"
+        "src/html/csp-conformance.lisp"
         "src/html/escape.lisp"
       ];
-      internal-deps = [ "sanitize" ];
+      internal-deps = [ "escape" ];
       external-deps = [ "iterate" "cl-who" "alexandria" "parenscript" "cl-ppcre" ];
       test-srcs = [
         "t/html/package.lisp"
@@ -98,22 +123,42 @@
         "src/server/security.lisp"
         "src/server/http-errors.lisp"
         "src/server/errors.lisp"
+        "src/server/assets.lisp"
         "src/server/app.lisp"
+        "src/server/streaming-gate.lisp"
         "src/server/routes.lisp"
       ];
-      internal-deps = [ "core" "html" ];
+      internal-deps = [ "escape" "core" "html" "crypto" "jschema" ];
       external-deps = [
-        "iterate" "let-over-lambda" "alexandria" "cl-ppcre" "babel"
-        "ironclad" "bordeaux-threads" "jzon" "hunchentoot" "flexi-streams"
-        "clack" "lack-core" "clack-session" "clack-csrf"
-        "clack-static" "clack-accesslog" "clack-cors"
+        "iterate"
+        "let-over-lambda"
+        "alexandria"
+        "cl-ppcre"
+        "babel"
+        "ironclad"
+        "bordeaux-threads"
+        "jzon"
+        "puri"
+        "hunchentoot"
+        "flexi-streams"
+        "clack"
+        "lack-core"
+        "clack-session"
+        "clack-csrf"
+        "clack-static"
+        "clack-accesslog"
+        "clack-cors"
         "clack-handler-hunchentoot"
       ];
+      test-external-deps = [ "lack-test" ];
       test-srcs = [
         "t/server/package.lisp"
         "t/server/suite.lisp"
         "t/server/server.lisp"
         "t/server/regression.lisp"
+        "t/server/assets.lisp"
+        "t/server/csp-invariant.lisp"
+        "t/server/http-e2e.lisp"
       ];
     };
 
@@ -126,7 +171,7 @@
         "src/jschema/validate.lisp"
         "src/jschema/keywords.lisp"
       ];
-      internal-deps = [];
+      internal-deps = [ "escape" ];
       external-deps = [ "alexandria" "bordeaux-threads" "cl-ppcre" "jzon" "puri" ];
       test-srcs = [
         "t/jschema/package.lisp"
@@ -144,7 +189,7 @@
         "src/extractors/defhandler.lisp"
         "src/extractors/sentinel.lisp"
       ];
-      internal-deps = [ "server" ];
+      internal-deps = [ "escape" "server" ];
       external-deps = [ "let-over-lambda" "bordeaux-threads" "babel" "flexi-streams" ];
       test-srcs = [
         "t/extractors/package.lisp"
@@ -186,14 +231,19 @@
         "src/htmx/server.lisp"
         "src/htmx/morph.lisp"
       ];
-      internal-deps = [ "css" "html" "server" ];
-      external-deps = [ "iterate" "parenscript" "cl-ppcre" "cl-who" ];
+      internal-deps = [ "escape" "crypto" "css" "html" "server" "parenscript" ];
+      external-deps = [ "iterate" "parenscript" "cl-ppcre" "cl-who" "babel" ];
+      test-external-deps = [ "lack-test" ];
       test-srcs = [
         "t/htmx/package.lisp"
         "t/htmx/suite.lisp"
         "t/htmx/htmx.lisp"
         "t/htmx/regression.lisp"
+        "t/htmx/e2e.lisp"
       ];
+      ## e2e.lisp's hx-on-strip coverage drives the broadcast-OOB path,
+      ## which lives in realtime; production htmx stays realtime-free.
+      test-internal-deps = [ "realtime" ];
     };
 
     realtime = {
@@ -202,12 +252,14 @@
         "src/realtime/websocket.lisp"
         "src/realtime/sse.lisp"
       ];
-      internal-deps = [ "server" ];
-      external-deps = [ "iterate" "websocket-driver-server" "bordeaux-threads" "hunchentoot" ];
+      internal-deps = [ "escape" "html" "server" ];
+      external-deps = [ "iterate" "websocket-driver-server" "bordeaux-threads" "hunchentoot" "babel" ];
+      test-external-deps = [ "lack-test" ];
       test-srcs = [
         "t/realtime/package.lisp"
         "t/realtime/suite.lisp"
         "t/realtime/regression.lisp"
+        "t/realtime/e2e.lisp"
       ];
     };
 
@@ -218,7 +270,7 @@
         "src/realtime/sse-client.lisp"
         "src/realtime/optimistic.lisp"
       ];
-      internal-deps = [];
+      internal-deps = [ "core" "html" ];
       external-deps = [ "iterate" "parenscript" ];
       test-srcs = [
         "t/realtime-htmx/package.lisp"
@@ -232,7 +284,7 @@
       srcs = [
         "src/async/resources.lisp"
       ];
-      internal-deps = [ "html" ];
+      internal-deps = [ "core" "css" "html" ];
       external-deps = [ "iterate" "let-over-lambda" "bordeaux-threads" "cl-who" ];
       test-srcs = [
         "t/resources/package.lisp"
@@ -246,7 +298,7 @@
       srcs = [
         "src/forms/form-dsl.lisp"
       ];
-      internal-deps = [ "sanitize" "css" "html" "server" ];
+      internal-deps = [ "escape" "core" "css" "html" "server" ];
       external-deps = [ "iterate" "let-over-lambda" "parenscript" "cl-who" "cl-ppcre" ];
       test-srcs = [
         "t/forms/package.lisp"
@@ -260,12 +312,16 @@
       srcs = [
         "src/wizards/wizards.lisp"
       ];
-      internal-deps = [ "css" "html" "server" ];
-      external-deps = [ "iterate" "let-over-lambda" "alexandria" "cl-who" "cl-ppcre" ];
+      internal-deps = [ "escape" "css" "html" "server" "extractors" ];
+      external-deps = [ "iterate" "let-over-lambda" "alexandria" "cl-who" "cl-ppcre" "bordeaux-threads" ];
+      test-external-deps = [ "lack-test" ];
+      test-internal-deps = [ "openapi" ];
       test-srcs = [
         "t/wizards/package.lisp"
         "t/wizards/suite.lisp"
         "t/wizards/wizards.lisp"
+        "t/wizards/regression.lisp"
+        "t/wizards/e2e.lisp"
       ];
     };
 
@@ -276,8 +332,14 @@
         "src/devtools/surgery-js.lisp"
         "src/devtools/surgery-routes.lisp"
       ];
-      internal-deps = [ "core" "html" "server" "extractors" ];
+      internal-deps = [ "escape" "core" "html" "server" "extractors" ];
       external-deps = [ "iterate" "let-over-lambda" "parenscript" "cl-who" ];
+      ## Opt-in: not pulled in by the umbrella system. Consumers that want
+      ## surgery must (asdf:load-system :lol-web/devtools) explicitly and
+      ## pair it with their own auth gating. The surgery panel modifies
+      ## live closure state and renders attacker-controllable component
+      ## IDs; shipping it by default is an auto-registration footgun.
+      opt-in = true;
       test-srcs = [
         "t/devtools/package.lisp"
         "t/devtools/suite.lisp"
@@ -291,7 +353,7 @@
       srcs = [
         "src/rendering/keyed-list.lisp"
       ];
-      internal-deps = [ "html" ];
+      internal-deps = [ "core" "html" ];
       external-deps = [ "iterate" "let-over-lambda" ];
       test-srcs = [
         "t/rendering/package.lisp"
@@ -303,15 +365,18 @@
     fullstack = {
       package-src = "src/packages/fullstack.lisp";
       srcs = [
+        "src/fullstack/hydration.lisp"
         "src/fullstack/component-api.lisp"
         "src/fullstack/isomorphic.lisp"
       ];
-      internal-deps = [ "core" "html" "server" "extractors" ];
+      internal-deps = [ "escape" "crypto" "core" "html" "server" "extractors" ];
       external-deps = [ "iterate" "let-over-lambda" "parenscript" "alexandria" "cl-who" ];
+      test-external-deps = [ "lack-test" ];
       test-srcs = [
         "t/fullstack/package.lisp"
         "t/fullstack/suite.lisp"
         "t/fullstack/regression.lisp"
+        "t/fullstack/e2e.lisp"
       ];
     };
 
@@ -349,7 +414,8 @@
   ## are concatenated in this order before the umbrella file (src/package.lisp,
   ## defining :lol-web and :lol-reactive) loads.
   load-order = [
-    "sanitize"
+    "escape"
+    "crypto"
     "core"
     "css"
     "parenscript"

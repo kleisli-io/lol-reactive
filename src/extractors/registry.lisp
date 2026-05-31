@@ -60,7 +60,15 @@
 
 (define-condition missing-extractor-input (extractor-error)
   ()
-  (:default-initargs :status 422)
+  ;; BODY is the wire message returned to the (unauthenticated) client; it
+  ;; stays generic so the 4xx response neither echoes input nor names the
+  ;; failing extractor. The REPORT carries the diagnostic for server logs.
+  (:default-initargs :status 422
+                     :body "A required parameter was missing.")
+  (:report (lambda (c s)
+             (format s "Missing required ~(~A~) extractor ~S."
+                     (extractor-error-kind c)
+                     (extractor-error-name c))))
   (:documentation
    "Signalled when REQUIRED-P is T and the extractor's source returned NIL.
     Translates to a 422 response."))
@@ -68,11 +76,23 @@
 (define-condition extractor-coercion-error (extractor-error)
   ((raw-value
     :initarg :raw-value
+    :initform nil
     :reader extractor-coercion-error-raw-value)
    (target-type
     :initarg :target-type
+    :initform nil
     :reader extractor-coercion-error-target-type))
-  (:default-initargs :status 400)
+  ;; BODY is generic on purpose: reflecting RAW-VALUE into a text/plain 400
+  ;; turns the endpoint into an input-echo / extractor-name+type oracle for
+  ;; an unauthenticated client. The full diagnostic lives in REPORT (logs).
+  (:default-initargs :status 400
+                     :body "A parameter value could not be processed.")
+  (:report (lambda (c s)
+             (format s "Cannot coerce ~S to ~A for ~A extractor ~S."
+                     (extractor-coercion-error-raw-value c)
+                     (extractor-coercion-error-target-type c)
+                     (extractor-error-kind c)
+                     (extractor-error-name c))))
   (:documentation
    "Signalled when the raw extracted value cannot be coerced to TARGET-TYPE.
     Translates to a 400 response."))

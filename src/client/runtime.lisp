@@ -11,12 +11,17 @@
 
 (defun lol-reactive-runtime-js ()
   "Generate the complete lol-reactive client runtime.
-   Includes HTMX runtime, WebSocket client, SSE client, and optimistic updates."
-  (concatenate 'string
-               (htmx-runtime-js)
-               ";"
-               (ws-client-js)
-               ";"
-               (sse-client-js)
-               ";"
-               (optimistic-js)))
+   Includes HTMX runtime, WebSocket client, SSE client, and optimistic updates.
+
+   HTMX runtime returns a SAFE-HTML-STRING (its content is consumed at
+   html-page sinks that consult the type); the bundler unwraps it to
+   concatenate, then re-tags the composite for downstream sinks."
+  (make-safe-html-string
+   (concatenate 'string
+                (safe-html-string-value (htmx-runtime-js))
+                ";"
+                (ws-client-js)
+                ";"
+                (sse-client-js)
+                ";"
+                (optimistic-js))))

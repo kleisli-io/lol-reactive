@@ -14,7 +14,8 @@
 (defsystem "lol-web"
   :description "Reactive web framework using Let Over Lambda patterns."
   :license "MIT"
-  :depends-on ("lol-web/sanitize"
+  :depends-on ("lol-web/escape"
+               "lol-web/crypto"
                "lol-web/core"
                "lol-web/css"
                "lol-web/parenscript"
@@ -29,7 +30,6 @@
                "lol-web/resources"
                "lol-web/forms"
                "lol-web/wizards"
-               "lol-web/devtools"
                "lol-web/rendering"
                "lol-web/fullstack"
                "lol-web/optimization"
@@ -39,15 +39,25 @@
   :components ((:file "src/package"))
   :in-order-to ((test-op (test-op "lol-web/test"))))
 
-(defsystem "lol-web/sanitize"
+(defsystem "lol-web/escape"
   :depends-on ("iterate"
                "cl-ppcre")
   :pathname "."
   :serial t
-  :components ((:file "src/packages/sanitize")
-               (:file "src/sanitize/sanitize")))
+  :components ((:file "src/packages/escape")
+               (:file "src/escape/escape")))
+(defsystem "lol-web/crypto"
+  :depends-on ("ironclad"
+               "babel")
+  :pathname "."
+  :serial t
+  :components ((:file "src/packages/crypto")
+               (:file "src/crypto/util")
+               (:file "src/crypto/password")
+               (:file "src/crypto/token")))
 (defsystem "lol-web/core"
-  :depends-on ("iterate"
+  :depends-on ("lol-web/crypto"
+               "iterate"
                "let-over-lambda"
                "bordeaux-threads"
                "alexandria")
@@ -58,6 +68,8 @@
                (:file "src/core/signals")
                (:file "src/core/state")
                (:file "src/core/collections")
+               (:file "src/core/bounded-cache")
+               (:file "src/core/cycle-safe-printer")
                (:file "src/composition/props")
                (:file "src/composition/context")
                (:file "src/composition/children")))
@@ -69,21 +81,24 @@
   :pathname "."
   :serial t
   :components ((:file "src/packages/css")
+               (:file "src/css/safety")
                (:file "src/css/generation")
                (:file "src/css/registry")
                (:file "src/css/tokens")
                (:file "src/css/tailwind")))
 (defsystem "lol-web/parenscript"
-  :depends-on ("iterate"
+  :depends-on ("lol-web/escape"
+               "iterate"
                "let-over-lambda"
                "parenscript"
                "cl-who")
   :pathname "."
   :serial t
   :components ((:file "src/packages/parenscript")
+               (:file "src/client/safety")
                (:file "src/client/parenscript")))
 (defsystem "lol-web/html"
-  :depends-on ("lol-web/sanitize"
+  :depends-on ("lol-web/escape"
                "iterate"
                "cl-who"
                "alexandria"
@@ -96,8 +111,11 @@
                (:file "src/html/page")
                (:file "src/html/escape")))
 (defsystem "lol-web/server"
-  :depends-on ("lol-web/core"
+  :depends-on ("lol-web/escape"
+               "lol-web/core"
                "lol-web/html"
+               "lol-web/crypto"
+               "lol-web/jschema"
                "iterate"
                "let-over-lambda"
                "alexandria"
@@ -106,6 +124,7 @@
                "ironclad"
                "bordeaux-threads"
                "com.inuoe.jzon"
+               "puri"
                "hunchentoot"
                "flexi-streams"
                "clack"
@@ -124,9 +143,11 @@
                (:file "src/server/http-errors")
                (:file "src/server/errors")
                (:file "src/server/app")
+               (:file "src/server/streaming-gate")
                (:file "src/server/routes")))
 (defsystem "lol-web/jschema"
-  :depends-on ("alexandria"
+  :depends-on ("lol-web/escape"
+               "alexandria"
                "bordeaux-threads"
                "cl-ppcre"
                "com.inuoe.jzon"
@@ -140,7 +161,8 @@
                (:file "src/jschema/validate")
                (:file "src/jschema/keywords")))
 (defsystem "lol-web/extractors"
-  :depends-on ("lol-web/server"
+  :depends-on ("lol-web/escape"
+               "lol-web/server"
                "let-over-lambda"
                "bordeaux-threads"
                "babel"
@@ -164,13 +186,17 @@
                (:file "src/openapi/schema-mapping")
                (:file "src/openapi/spec-builder")))
 (defsystem "lol-web/htmx"
-  :depends-on ("lol-web/css"
+  :depends-on ("lol-web/escape"
+               "lol-web/crypto"
+               "lol-web/css"
                "lol-web/html"
                "lol-web/server"
+               "lol-web/parenscript"
                "iterate"
                "parenscript"
                "cl-ppcre"
-               "cl-who")
+               "cl-who"
+               "babel")
   :pathname "."
   :serial t
   :components ((:file "src/packages/htmx")
@@ -184,18 +210,23 @@
                (:file "src/htmx/server")
                (:file "src/htmx/morph")))
 (defsystem "lol-web/realtime"
-  :depends-on ("lol-web/server"
+  :depends-on ("lol-web/escape"
+               "lol-web/html"
+               "lol-web/server"
                "iterate"
                "websocket-driver-server"
                "bordeaux-threads"
-               "hunchentoot")
+               "hunchentoot"
+               "babel")
   :pathname "."
   :serial t
   :components ((:file "src/packages/realtime")
                (:file "src/realtime/websocket")
                (:file "src/realtime/sse")))
 (defsystem "lol-web/realtime-htmx"
-  :depends-on ("iterate"
+  :depends-on ("lol-web/core"
+               "lol-web/html"
+               "iterate"
                "parenscript")
   :pathname "."
   :serial t
@@ -204,7 +235,9 @@
                (:file "src/realtime/sse-client")
                (:file "src/realtime/optimistic")))
 (defsystem "lol-web/resources"
-  :depends-on ("lol-web/html"
+  :depends-on ("lol-web/core"
+               "lol-web/css"
+               "lol-web/html"
                "iterate"
                "let-over-lambda"
                "bordeaux-threads"
@@ -214,7 +247,8 @@
   :components ((:file "src/packages/resources")
                (:file "src/async/resources")))
 (defsystem "lol-web/forms"
-  :depends-on ("lol-web/sanitize"
+  :depends-on ("lol-web/escape"
+               "lol-web/core"
                "lol-web/css"
                "lol-web/html"
                "lol-web/server"
@@ -228,20 +262,24 @@
   :components ((:file "src/packages/forms")
                (:file "src/forms/form-dsl")))
 (defsystem "lol-web/wizards"
-  :depends-on ("lol-web/css"
+  :depends-on ("lol-web/escape"
+               "lol-web/css"
                "lol-web/html"
                "lol-web/server"
+               "lol-web/extractors"
                "iterate"
                "let-over-lambda"
                "alexandria"
                "cl-who"
-               "cl-ppcre")
+               "cl-ppcre"
+               "bordeaux-threads")
   :pathname "."
   :serial t
   :components ((:file "src/packages/wizards")
                (:file "src/wizards/wizards")))
 (defsystem "lol-web/devtools"
-  :depends-on ("lol-web/core"
+  :depends-on ("lol-web/escape"
+               "lol-web/core"
                "lol-web/html"
                "lol-web/server"
                "lol-web/extractors"
@@ -256,7 +294,8 @@
                (:file "src/devtools/surgery-js")
                (:file "src/devtools/surgery-routes")))
 (defsystem "lol-web/rendering"
-  :depends-on ("lol-web/html"
+  :depends-on ("lol-web/core"
+               "lol-web/html"
                "iterate"
                "let-over-lambda")
   :pathname "."
@@ -264,7 +303,9 @@
   :components ((:file "src/packages/rendering")
                (:file "src/rendering/keyed-list")))
 (defsystem "lol-web/fullstack"
-  :depends-on ("lol-web/core"
+  :depends-on ("lol-web/escape"
+               "lol-web/crypto"
+               "lol-web/core"
                "lol-web/html"
                "lol-web/server"
                "lol-web/extractors"
@@ -276,6 +317,7 @@
   :pathname "."
   :serial t
   :components ((:file "src/packages/fullstack")
+               (:file "src/fullstack/hydration")
                (:file "src/fullstack/component-api")
                (:file "src/fullstack/isomorphic")))
 (defsystem "lol-web/optimization"
@@ -304,16 +346,28 @@
   :components ((:file "src/packages/client-runtime")
                (:file "src/client/runtime")))
 
-(defsystem "lol-web/sanitize/test"
-  :depends-on ("lol-web/sanitize"
+(defsystem "lol-web/escape/test"
+  :depends-on ("lol-web/escape"
                "fiveam")
   :pathname "."
   :serial t
-  :components ((:file "t/sanitize/package")
-               (:file "t/sanitize/suite")
-               (:file "t/sanitize/sanitize"))
+  :components ((:file "t/escape/package")
+               (:file "t/escape/suite")
+               (:file "t/escape/escape"))
   :perform (test-op (op c)
-             (uiop:symbol-call :lol-web/sanitize/test :run-tests)))
+             (uiop:symbol-call :lol-web/escape/test :run-tests)))
+(defsystem "lol-web/crypto/test"
+  :depends-on ("lol-web/crypto"
+               "fiveam")
+  :pathname "."
+  :serial t
+  :components ((:file "t/crypto/package")
+               (:file "t/crypto/suite")
+               (:file "t/crypto/util")
+               (:file "t/crypto/password")
+               (:file "t/crypto/token"))
+  :perform (test-op (op c)
+             (uiop:symbol-call :lol-web/crypto/test :run-tests)))
 (defsystem "lol-web/core/test"
   :depends-on ("lol-web/core"
                "fiveam")
@@ -370,7 +424,8 @@
   :components ((:file "t/server/package")
                (:file "t/server/suite")
                (:file "t/server/server")
-               (:file "t/server/regression"))
+               (:file "t/server/regression")
+               (:file "t/server/http-e2e"))
   :perform (test-op (op c)
              (uiop:symbol-call :lol-web/server/test :run-tests)))
 (defsystem "lol-web/jschema/test"
@@ -406,13 +461,15 @@
              (uiop:symbol-call :lol-web/openapi/test :run-tests)))
 (defsystem "lol-web/htmx/test"
   :depends-on ("lol-web/htmx"
-               "fiveam")
+               "fiveam"
+               "lol-web/realtime")
   :pathname "."
   :serial t
   :components ((:file "t/htmx/package")
                (:file "t/htmx/suite")
                (:file "t/htmx/htmx")
-               (:file "t/htmx/regression"))
+               (:file "t/htmx/regression")
+               (:file "t/htmx/e2e"))
   :perform (test-op (op c)
              (uiop:symbol-call :lol-web/htmx/test :run-tests)))
 (defsystem "lol-web/realtime/test"
@@ -422,7 +479,8 @@
   :serial t
   :components ((:file "t/realtime/package")
                (:file "t/realtime/suite")
-               (:file "t/realtime/regression"))
+               (:file "t/realtime/regression")
+               (:file "t/realtime/e2e"))
   :perform (test-op (op c)
              (uiop:symbol-call :lol-web/realtime/test :run-tests)))
 (defsystem "lol-web/realtime-htmx/test"
@@ -457,12 +515,15 @@
              (uiop:symbol-call :lol-web/forms/test :run-tests)))
 (defsystem "lol-web/wizards/test"
   :depends-on ("lol-web/wizards"
-               "fiveam")
+               "fiveam"
+               "lol-web/openapi")
   :pathname "."
   :serial t
   :components ((:file "t/wizards/package")
                (:file "t/wizards/suite")
-               (:file "t/wizards/wizards"))
+               (:file "t/wizards/wizards")
+               (:file "t/wizards/regression")
+               (:file "t/wizards/e2e"))
   :perform (test-op (op c)
              (uiop:symbol-call :lol-web/wizards/test :run-tests)))
 (defsystem "lol-web/devtools/test"
@@ -493,7 +554,8 @@
   :serial t
   :components ((:file "t/fullstack/package")
                (:file "t/fullstack/suite")
-               (:file "t/fullstack/regression"))
+               (:file "t/fullstack/regression")
+               (:file "t/fullstack/e2e"))
   :perform (test-op (op c)
              (uiop:symbol-call :lol-web/fullstack/test :run-tests)))
 (defsystem "lol-web/optimization/test"
@@ -520,7 +582,8 @@
 (defsystem "lol-web/test"
   :depends-on ("lol-web"
                "fiveam"
-               "lol-web/sanitize/test"
+               "lol-web/escape/test"
+               "lol-web/crypto/test"
                "lol-web/core/test"
                "lol-web/css/test"
                "lol-web/parenscript/test"

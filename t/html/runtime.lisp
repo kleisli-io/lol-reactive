@@ -6,7 +6,7 @@
   (is (fboundp 'reactive-runtime-js)))
 
 (test reactive-runtime-js-generates-code
-  "reactive-runtime-js generates JavaScript"
+  "reactive-runtime-js generates JavaScript tagged as SAFE-HTML-STRING"
   (let ((js (reactive-runtime-js)))
-    (is (stringp js))
-    (is (> (length js) 100))))
+    (is (safe-html-string-p js))
+    (is (> (length (safe-html-string-value js)) 100))))

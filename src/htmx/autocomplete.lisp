@@ -46,25 +46,27 @@
    CLASS: Additional CSS classes for the container"
   (declare (ignore min-chars)) ; Reserved for future use
   (htm-str
-    (:div :class (format nil "autocomplete-container~@[ ~a~]" class)
+    (:div :class (lol-web/escape:safe-attr
+                  (format nil "autocomplete-container~@[ ~a~]" class))
       (:input :type "search"
-              :id id
+              :id (lol-web/escape:safe-attr id)
               :name "q"
-              :placeholder placeholder
+              :placeholder (lol-web/escape:safe-attr placeholder)
               :autocomplete "off"
-              :hx-get endpoint
-              :hx-trigger (format nil "input changed delay:~ams" debounce)
-              :hx-target (format nil "#~a-results" id)
+              :hx-get (lol-web/escape:safe-href endpoint)
+              :hx-trigger (lol-web/escape:safe-attr
+                           (format nil "input changed delay:~ams" debounce))
+              :hx-target (lol-web/escape:safe-attr (format nil "#~a-results" id))
               :hx-sync "this:replace"
-              :hx-indicator (format nil "#~a-loading" id)
+              :hx-indicator (lol-web/escape:safe-attr (format nil "#~a-loading" id))
               :role "combobox"
-              :aria-controls (format nil "~a-results" id)
+              :aria-controls (lol-web/escape:safe-attr (format nil "~a-results" id))
               :aria-expanded "false"
               :aria-autocomplete "list")
-      (:span :id (format nil "~a-loading" id)
+      (:span :id (lol-web/escape:safe-attr (format nil "~a-loading" id))
              :class "htmx-indicator autocomplete-loading"
              "Searching...")
-      (:div :id (format nil "~a-results" id)
+      (:div :id (lol-web/escape:safe-attr (format nil "~a-results" id))
             :role "listbox"
             :class "autocomplete-results"
             :aria-label "Search results"))))
@@ -74,30 +76,35 @@
 
    ITEMS: List of items to render
    ID: Autocomplete ID (must match render-autocomplete)
-   RENDER-ITEM: Function to render each item (default: identity)
-   EMPTY-MESSAGE: Message to show when no results"
+   RENDER-ITEM: Function to render each item — return SAFE-HTML-STRING
+                to emit verbatim, bare strings get escape-html applied
+                at the render boundary
+   EMPTY-MESSAGE: Message to show when no results — bare string is
+                  escaped; pass SAFE-HTML-STRING to emit verbatim"
   (let ((render-fn (or render-item #'identity)))
     (htm-str
       (if items
           (cl-who:htm
-            (:ul :id (format nil "~a-results" id)
+            (:ul :id (lol-web/escape:safe-attr (format nil "~a-results" id))
                  :role "listbox"
                  :class "autocomplete-results"
               (loop for item in items
                     for i from 0
                     do (cl-who:htm
                         (:li :role "option"
-                             :id (format nil "~a-option-~a" id i)
+                             :id (lol-web/escape:safe-attr
+                                  (format nil "~a-option-~a" id i))
                              :class "autocomplete-result"
                              :tabindex "-1"
                              :aria-selected "false"
-                             (cl-who:str (funcall render-fn item)))))))
+                             (cl-who:str (coerce-html-emit
+                                          (funcall render-fn item))))))))
           (cl-who:htm
-            (:div :id (format nil "~a-results" id)
+            (:div :id (lol-web/escape:safe-attr (format nil "~a-results" id))
                   :role "listbox"
                   :class "autocomplete-results autocomplete-empty"
               (:span :class "autocomplete-no-results"
-                     (cl-who:str empty-message))))))))
+                     (cl-who:str (coerce-html-emit empty-message)))))))))
 
 (defun autocomplete-css ()
   "CSS for autocomplete component using design system tokens.

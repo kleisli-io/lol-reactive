@@ -39,6 +39,11 @@
 (defun generate-hydration-script (component-id component-name state actions)
   "Generate JavaScript to hydrate a server-rendered component."
   (declare (ignore actions))  ; Actions handled by API routes
+  ;; component-id lands in a <script> body; defuse any </script> so a
+  ;; hostile id cannot end the element early (parenscript JS-quoting does
+  ;; not neutralize a literal close tag).
+  (let ((component-id (lol-web/escape:neutralize-script-close
+                       (princ-to-string component-id))))
   (parenscript:ps*
     `(progn
        ;; Wait for DOM ready
@@ -88,7 +93,7 @@
                        (when action
                          (let ((comp (ps:@ window ,(symb (string-upcase component-name) "-" component-id))))
                            ((ps:@ comp dispatch) action))))))
-                  ((ps:@ console log) "(hydrated:" ,component-id ")"))))))))))
+                  ((ps:@ console log) "(hydrated:" ,component-id ")")))))))))))
 
 ;;; ============================================================================
 ;;; DEFISOMORPHIC-COMPONENT MACRO
@@ -149,8 +154,8 @@
                                              state)))))
            (format nil
                    "<div data-component-id=\"~A\" data-component=\"~A\" data-state=\"~A\">~A</div>~A"
-                   id
-                   ',name
+                   (lol-web/escape:safe-attr id)
+                   (lol-web/escape:safe-attr ',name)
                    state-json
                    html
                    (format nil "<script>~A</script>"
@@ -159,7 +164,8 @@
        ;; Export action dispatch helper for templates
        (defun ,(symb name "-ACTION") (action)
          "Generate data-action attribute for event binding."
-         (format nil "data-action=\"~A\"" (string-downcase action)))
+         (format nil "data-action=\"~A\""
+                 (lol-web/escape:safe-attr (string-downcase action))))
 
        ',name))
 
@@ -170,8 +176,8 @@
 (defun with-hydration-wrapper (component-id component-name state-alist html)
   "Wrap rendered HTML with hydration data attributes."
   (format nil "<div data-component-id=\"~A\" data-component=\"~A\" data-state=\"~A\">~A</div>"
-          component-id
-          component-name
+          (lol-web/escape:safe-attr component-id)
+          (lol-web/escape:safe-attr component-name)
           (serialize-state-for-attr state-alist)
           html))
 
@@ -179,9 +185,10 @@
   "Generate data-action attribute with optional arguments."
   (if args
       (format nil "data-action=\"~A\" data-args=\"~A\""
-              (string-downcase action)
+              (lol-web/escape:safe-attr (string-downcase action))
               (escape-html (encode-json-string args)))
-      (format nil "data-action=\"~A\"" (string-downcase action))))
+      (format nil "data-action=\"~A\""
+              (lol-web/escape:safe-attr (string-downcase action)))))
 
 ;;; ============================================================================
 ;;; RUNTIME HYDRATION SUPPORT
@@ -230,12 +237,25 @@
 
 (defun isomorphic-page (title &key head body components)
   "Generate a full page with isomorphic components.
-   COMPONENTS: List of isomorphic component render forms."
+   COMPONENTS: List of isomorphic component render forms.
+
+   HEAD and BODY accept SAFE-HTML-STRING (emitted verbatim) or raw
+   strings (escape-html-ed). COMPONENTS contributions are pre-rendered
+   isomorphic-component HTML and are wrapped as SAFE-HTML-STRING so the
+   final body is emitted as raw HTML."
   (html-page
    :title title
-   :head (concatenate 'string
-                      (or head "")
-                      (include-hydration-runtime))
-   :body (format nil "~A~{~A~}"
-                 (or body "")
-                 components)))
+   :head-extra
+     (make-safe-html-string
+       (concatenate 'string
+         (cond ((safe-html-string-p head) (safe-html-string-value head))
+               ((null head) "")
+               (t (escape-html head)))
+         (include-hydration-runtime)))
+   :body
+     (make-safe-html-string
+       (format nil "~A~{~A~}"
+               (cond ((safe-html-string-p body) (safe-html-string-value body))
+                     ((null body) "")
+                     (t (escape-html body)))
+               components))))

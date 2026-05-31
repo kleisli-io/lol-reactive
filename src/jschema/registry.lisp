@@ -1,12 +1,10 @@
 ;;;; -*- Mode: LISP; Syntax: COMMON-LISP; Package: LOL-WEB/JSCHEMA; Base: 10 -*-
 ;;;; The JSON-SCHEMA struct and the cross-document registry.
 ;;;;
-;;;; Two namespaces:
-;;;;   (a) *REGISTRY* — global URI → JSON-SCHEMA. Populated when a parsed
-;;;;       schema declared an $id with a host. CLEAR-REGISTRY wipes it.
-;;;;   (b) self-registry — per-document JSON Pointer → JSON-SCHEMA. Lives on
-;;;;       each root JSON-SCHEMA instance. Populated by parse as it descends.
-;;;;       Used to resolve same-document $ref / $dynamicRef.
+;;;; *REGISTRY* (URI → JSON-SCHEMA) holds hosted $id documents; image-global
+;;;; by default, let-bound per-app by make-app's :SCHEMA-REGISTRY middleware.
+;;;; Each root schema also carries a self-registry (JSON Pointer → child)
+;;;; for same-document $ref / $dynamicRef resolution.
 
 (in-package :lol-web/jschema)
 
@@ -34,9 +32,11 @@
 ;;; ============================================================================
 
 (defvar *registry* (make-hash-table :test 'equal)
-  "Global cross-document registry. Keys are URI strings (post-resolution).
-   Values are JSON-SCHEMA instances. Populated by PARSE when the input
-   document declares a hosted $id.")
+  "Cross-document schema registry. Keys are URI strings (post-resolution),
+   values are JSON-SCHEMA instances. Image-global by default; let-bound
+   per-app by make-app's :SCHEMA-REGISTRY middleware so two apps in one
+   image can hold disjoint URI namespaces. Mutated only through
+   REGISTER-SCHEMA / CLEAR-REGISTRY under *REGISTRY-LOCK*.")
 
 (defvar *registry-lock*
   (bordeaux-threads:make-recursive-lock "lol-web/jschema registry"))
@@ -46,6 +46,13 @@
   (bordeaux-threads:with-recursive-lock-held (*registry-lock*)
     (clrhash *registry*))
   (values))
+
+(defun call-with-registry (registry-table thunk)
+  "Funcall THUNK with *REGISTRY* let-bound to REGISTRY-TABLE. Keeps the
+   dynamic-binding establishment inside the package that owns the special
+   so cross-package callers don't have to declare it themselves."
+  (let ((*registry* registry-table))
+    (funcall thunk)))
 
 (defun register-schema (uri schema)
   "Register SCHEMA under URI in the global registry. URI is a string."
@@ -80,8 +87,4 @@
    else is treated as an anchor name."
   (let ((self (json-schema-self-registry root)))
     (when self
-      (gethash (if (or (string= fragment "")
-                       (char= (char fragment 0) #\/))
-                   fragment
-                   fragment)
-               self))))
+      (gethash fragment self))))

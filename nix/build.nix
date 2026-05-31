@@ -17,11 +17,12 @@ let
 
   testSrcPath = moduleName: file:
     if moduleName == "openapi" && file == "t/openapi/regression.lisp"
-    then pkgs.runCommand "lol-web-openapi-regression.lisp" { } ''
-      substitute ${toPath file} $out --replace-fail \
-        ${pkgs.lib.escapeShellArg "(defparameter *openapi-3.1-schema-path* nil"} \
-        ${pkgs.lib.escapeShellArg ''(defparameter *openapi-3.1-schema-path* "${openapiSchemaFixture}"''}
-    ''
+    then
+      pkgs.runCommand "lol-web-openapi-regression.lisp" { } ''
+        substitute ${toPath file} $out --replace-fail \
+          ${pkgs.lib.escapeShellArg "(defparameter *openapi-3.1-schema-path* nil"} \
+          ${pkgs.lib.escapeShellArg ''(defparameter *openapi-3.1-schema-path* "${openapiSchemaFixture}"''}
+      ''
     else toPath file;
 
   ## Per-sub-system buildLisp.library derivations. Each compiles its own
@@ -35,6 +36,9 @@ let
   ## test-internal-deps adds extra in-tree sub-systems to the standalone
   ## test closure (e.g. openapi's tests pull jschema for the conformance
   ## gate, while production openapi keeps a jschema-free dep set).
+  ## test-external-deps adds extra external libraries to the test closure
+  ## without leaking into the production closure (e.g. server's tests pull
+  ## lack-test for synthetic-request E2E coverage).
   modules = builtins.mapAttrs
     (name: cfg:
       let
@@ -44,13 +48,16 @@ let
           ## The consumer-facing attribute path keeps the slash form.
           name = "lol-web-${name}";
           deps = resolveExternal cfg.external-deps
-              ++ map (n: modules.${n}) cfg.internal-deps;
+            ++ map (n: modules.${n}) cfg.internal-deps;
           srcs = map toPath ([ cfg.package-src ] ++ cfg.srcs);
         };
-        testInternal = cfg.test-internal-deps or [];
-        testsAttr = pkgs.lib.optionalAttrs (cfg.test-srcs != []) {
+        testInternal = cfg.test-internal-deps or [ ];
+        testExternal = cfg.test-external-deps or [ ];
+        testsAttr = pkgs.lib.optionalAttrs (cfg.test-srcs != [ ]) {
           tests = {
-            deps = testDeps ++ map (n: modules.${n}) testInternal;
+            deps = testDeps
+              ++ map (n: modules.${n}) testInternal
+              ++ resolveExternal testExternal;
             srcs = map (testSrcPath name) cfg.test-srcs;
             expression = ''(lol-web/${name}/test:run-tests)'';
           };
@@ -75,9 +82,21 @@ let
   ## then every module's body sources (in load-order), then the umbrella file
   ## (which defines :lol-web and the :lol-reactive shim).
   allExternalDeps =
-    let names = builtins.concatLists
-      (map (cfg: cfg.external-deps) (builtins.attrValues table.modules));
-    in pkgs.lib.unique names;
+    let
+      names = builtins.concatLists
+        (map (cfg: cfg.external-deps) (builtins.attrValues table.modules));
+    in
+    pkgs.lib.unique names;
+
+  ## Test-only externals across all modules. Threaded into the umbrella's
+  ## test phase but kept out of the umbrella's production dep closure.
+  allTestExternalDeps =
+    let
+      names = builtins.concatLists
+        (map (cfg: cfg.test-external-deps or [ ])
+          (builtins.attrValues table.modules));
+    in
+    pkgs.lib.unique names;
 
   ## Umbrella's test phase loads every per-sub-system test file (so each
   ## :lol-web/<sub>/test suite is registered) and then the umbrella's own
@@ -92,10 +111,10 @@ let
     name = "lol-web";
     deps = resolveExternal allExternalDeps;
     srcs = map toPath (packageSrcsInOrder
-                       ++ moduleBodySrcsInOrder
-                       ++ [ table.umbrella-src ]);
+      ++ moduleBodySrcsInOrder
+      ++ [ table.umbrella-src ]);
     tests = {
-      deps = testDeps;
+      deps = testDeps ++ resolveExternal allTestExternalDeps;
       srcs = map toPath umbrellaTestSrcs;
       expression = "(lol-web/test:run-all-tests)";
     };
@@ -104,7 +123,8 @@ let
     };
   };
 
-in {
+in
+{
   library = umbrellaLib;
   inherit modules;
 }

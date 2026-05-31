@@ -15,6 +15,9 @@
   (:import-from :let-over-lambda
                 :defmacro!
                 :symb)
+  ;; :type :keyword / :type :symbol coercers go through safe-coerce-keyword.
+  (:import-from :lol-web/escape
+                #:safe-coerce-keyword)
   (:export
    ;; registry.lisp — protocol surface
    #:extractor-spec

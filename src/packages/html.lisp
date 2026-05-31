@@ -2,7 +2,7 @@
 ;;;; :lol-web/html — HTML rendering, page template, escape
 ;;;;   src/html/{elements,page,escape}.lisp
 ;;;;
-;;;; Stands alone in the package graph apart from :lol-web/sanitize. html-page
+;;;; Stands alone in the package graph apart from :lol-web/escape. html-page
 ;;;; references later-loaded helpers (htmx, server, devtools) through their
 ;;;; full package names so this sub-package can be consumed independently.
 
@@ -10,12 +10,14 @@
 
 (defpackage :lol-web/html
   (:use :cl :iterate
-        :lol-web/sanitize)
+        :lol-web/escape)
   (:export
    ;; elements.lisp
    #:htm
    #:htm-str
    #:html-attrs
+   #:safe-attribute-name-p
+   #:unsafe-attribute-name
    #:render-component
    #:component->html
    #:*component-render-hook*
@@ -23,7 +25,13 @@
    ;; page.lisp
    #:html-page
    #:reactive-runtime-js
+   ;; csp-conformance.lisp
+   #:csp-inline-violations
    ;; escape.lisp
-   #:escape-html
    #:safe-str
-   #:safe-fmt))
+   #:safe-fmt
+   #:safe-html-string
+   #:safe-html-string-p
+   #:safe-html-string-value
+   #:make-safe-html-string
+   #:coerce-html-emit))

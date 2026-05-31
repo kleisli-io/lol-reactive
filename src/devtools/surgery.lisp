@@ -8,17 +8,29 @@
 (in-package :lol-web/devtools)
 
 ;;; ============================================================================
-;;; SNAPSHOT SYSTEM
+;;; SNAPSHOT / UNDO / REDO
 ;;;
-;;; Capture and restore component state at any point in time.
-;;; Each snapshot is a frozen copy of all pandoric variables.
+;;; Snapshot, undo, and redo stacks live on the component's registry entry
+;;; (see :lol-web/core's COMPONENT-SNAPSHOTS / COMPONENT-UNDO-STACK /
+;;; COMPONENT-REDO-STACK); they die with UNREGISTER-COMPONENT. Each stack
+;;; is FIFO-capped per the corresponding *MAX-* defparameter below.
+;;; Operations on unregistered components are silent no-ops returning NIL.
 ;;; ============================================================================
 
-(defparameter *snapshots* (make-hash-table :test 'equal)
-  "Component ID -> list of (timestamp . state-alist) snapshots.")
-
 (defparameter *max-snapshots-per-component* 20
-  "Maximum number of snapshots to keep per component.")
+  "Per-component snapshot cap; FIFO eviction past this depth.")
+
+(defparameter *max-undo-depth* 1000
+  "Per-component undo cap; FIFO eviction past this depth.")
+
+(defparameter *max-redo-depth* 1000
+  "Per-component redo cap; FIFO eviction past this depth.")
+
+(defun %trim-stack (stack cap)
+  "Drop oldest entries past CAP. STACK is most-recent-first."
+  (if (and cap (> (length stack) cap))
+      (subseq stack 0 cap)
+      stack))
 
 (defun normalize-state-pairs (pairs)
   "Normalize state PAIRS to alist form ((key . value) ...).
@@ -34,30 +46,32 @@
              collect (cons key value)))))
 
 (defun capture-snapshot (component &optional description)
-  "Capture current component state as a restorable snapshot.
-   Returns the snapshot ID (timestamp)."
-  (let* ((component-id (funcall component :id))
-         (state (funcall component :inspect))
-         (timestamp (get-universal-time))
-         (snapshot (list :timestamp timestamp
-                         :description (or description "Manual snapshot")
-                         :state (getf state :state))))
-    ;; Add to front of list
-    (push snapshot (gethash component-id *snapshots*))
-    ;; Trim if over limit
-    (when (> (length (gethash component-id *snapshots*))
-             *max-snapshots-per-component*)
-      (setf (gethash component-id *snapshots*)
-            (subseq (gethash component-id *snapshots*)
-                    0 *max-snapshots-per-component*)))
-    timestamp))
+  "Capture current state as a restorable snapshot. Returns the
+   timestamp ID, or NIL when COMPONENT is not registered. The
+   read-modify-write over the snapshot stack runs under the component
+   registry lock, so a concurrent capture or surgery mutation cannot
+   drop or duplicate a snapshot frame."
+  (lol-web/core:with-components-lock
+    (let* ((component-id (funcall component :id))
+           (entry (gethash component-id lol-web/core:*components*)))
+      (when entry
+        (let* ((state (funcall component :inspect))
+               (timestamp (get-universal-time))
+               (snapshot (list :timestamp timestamp
+                               :description (or description "Manual snapshot")
+                               :state (getf state :state))))
+          (setf (lol-web/core:component-snapshots component-id)
+                (%trim-stack (cons snapshot
+                                   (lol-web/core:component-snapshots component-id))
+                             *max-snapshots-per-component*))
+          timestamp)))))
 
 (defun list-snapshots (component)
-  "List all snapshots for a component."
+  "List all snapshots for COMPONENT (closure or string ID)."
   (let ((component-id (if (stringp component)
                           component
                           (funcall component :id))))
-    (gethash component-id *snapshots*)))
+    (lol-web/core:component-snapshots component-id)))
 
 (defun find-snapshot (component timestamp)
   "Find a specific snapshot by timestamp."
@@ -65,20 +79,23 @@
     (find timestamp snapshots :key (lambda (s) (getf s :timestamp)))))
 
 (defun restore-snapshot (component timestamp)
-  "Restore component to a previous snapshot state.
-   Uses with-pandoric to surgically update each state variable."
-  (let ((snapshot (find-snapshot component timestamp)))
-    (when snapshot
-      (dolist (pair (normalize-state-pairs (getf snapshot :state)))
-        (funcall component :set-state (car pair) (cdr pair)))
-      t)))
+  "Restore component to a previous snapshot state. The lookup and the
+   per-variable updates run under the component registry lock so a
+   concurrent surgery write, undo, or redo cannot interleave and leave the
+   component half-restored."
+  (lol-web/core:with-components-lock
+    (let ((snapshot (find-snapshot component timestamp)))
+      (when snapshot
+        (dolist (pair (normalize-state-pairs (getf snapshot :state)))
+          (funcall component :set-state (car pair) (cdr pair)))
+        t))))
 
 (defun clear-snapshots (component)
-  "Clear all snapshots for a component."
+  "Clear all snapshots for COMPONENT (closure or string ID)."
   (let ((component-id (if (stringp component)
                           component
                           (funcall component :id))))
-    (remhash component-id *snapshots*)))
+    (setf (lol-web/core:component-snapshots component-id) nil)))
 
 ;;; ============================================================================
 ;;; STATE TREE EXTRACTION
@@ -99,17 +116,10 @@
                          (normalize-state-pairs (getf inspection :state)))))))
 
 (defun format-value-for-json (value)
-  "Format a Lisp value for JSON representation."
-  (typecase value
-    (null :null)
-    ((eql t) t)
-    (number value)
-    (string value)
-    (keyword (format nil "~a" value))
-    (symbol (format nil "~a" value))
-    (list (mapcar #'format-value-for-json value))
-    (hash-table (hash-table-to-alist value))
-    (t (format nil "~s" value))))
+  "Format a Lisp value into a bounded, cycle-safe JSON-serializable tree.
+   Delegates to BOUNDED-SERIALIZE so a deep, wide, or cyclic component state
+   cannot exhaust memory or loop when the surgery panel inspects it."
+  (bounded-serialize value))
 
 (defun type-of-value (value)
   "Return a string describing the type for UI display."
@@ -126,15 +136,34 @@
     (function "function")
     (t (format nil "~a" (type-of value)))))
 
-(defun hash-table-to-alist (ht)
-  "Convert hash table to alist for JSON."
-  (let ((result '()))
-    (maphash (lambda (k v)
-               (push (cons (format nil "~a" k)
-                           (format-value-for-json v))
-                     result))
-             ht)
-    (nreverse result)))
+;;; ============================================================================
+;;; PUBLIC CONDITION FORMATTER
+;;;
+;;; Surgery handlers can raise arbitrary conditions; the wire response must
+;;; not echo the condition's printed report because that can leak internal
+;;; paths, secrets, and stack-frame details to whoever can flip surgery
+;;; mode. PUBLIC-CONDITION-MESSAGE returns just the class name unless the
+;;; class is whitelisted in *PUBLIC-CONDITION-ACCESSORS*.
+;;; ============================================================================
+
+(defparameter *public-condition-accessors* nil
+  "Alist of (CONDITION-CLASS-NAME . (ACCESSOR-FN ...)). Each ACCESSOR-FN
+   receives the condition and must return a value that is itself safe to
+   echo (no FORMAT calls over the condition). Default empty: only the
+   class name is returned. Extend at consumer discretion when a specific
+   condition class has known-safe accessors.")
+
+(defun public-condition-message (c)
+  "Render condition C as a wire-safe alist. Always includes (:CLASS ...);
+   includes (:FIELDS ...) only when C's class is whitelisted in
+   *PUBLIC-CONDITION-ACCESSORS*. Never invokes the condition's report
+   function and never reads slots that are not on the whitelist."
+  (let* ((class-name (class-name (class-of c)))
+         (accessors (cdr (assoc class-name *public-condition-accessors*))))
+    (if accessors
+        (list :class class-name
+              :fields (mapcar (lambda (acc) (funcall acc c)) accessors))
+        (list :class class-name))))
 
 ;;; ============================================================================
 ;;; SURGERY OPERATIONS
@@ -150,46 +179,29 @@
 
 (defun surgery-set-state (component-id key value)
   "Set a specific state value in a component.
-   This is the 'magic' - directly modifying closure state."
-  (let ((component (find-component component-id)))
-    (when component
-      ;; Capture before state for potential undo
-      (capture-snapshot component "Before surgery")
-      (funcall component :set-state key value)
-      ;; Return updated state tree
-      (component-state-tree component))))
-
-(defun surgery-eval-in-context (component-id form-string)
-  "Evaluate a Lisp form in the context of a component's state.
-   This is the REPL integration - execute arbitrary code with access to state."
-  (let ((component (find-component component-id)))
-    (when component
-      (let ((inspection (funcall component :inspect)))
-        ;; Build a let binding with current state values
-        (let ((bindings (mapcar (lambda (pair)
-                                  (list (car pair) (cdr pair)))
-                                (getf inspection :state))))
-          (handler-case
-              (let* ((form (read-from-string form-string))
-                     ;; Create a lambda that has access to state setters
-                     (result (eval `(let ,bindings
-                                      (macrolet ((set-state (key val)
-                                                   `(funcall (find-component ,',component-id)
-                                                             :set-state ,key ,val)))
-                                        ,form)))))
-                `((:success . t)
-                  (:result . ,(format nil "~s" result))
-                  (:state . ,(component-state-tree component))))
-            (error (e)
-              `((:success . nil)
-                (:error . ,(format nil "~a" e))))))))))
+   This is the 'magic' - directly modifying closure state. The snapshot
+   capture and the state mutation run as one operation under the component
+   registry lock — the same lock SURGERY-UNDO/SURGERY-REDO hold — so a
+   concurrent undo, redo, or surgery write cannot interleave between the
+   pre-mutation snapshot and the mutation and tear the history."
+  (lol-web/core:with-components-lock
+    (let ((component (find-component component-id)))
+      (when component
+        (capture-snapshot component "Before surgery")
+        (funcall component :set-state key value)
+        (component-state-tree component)))))
 
 (defun surgery-dispatch (component-id action &rest args)
-  "Dispatch an action to a component and return updated state."
-  (let ((component (find-component component-id)))
-    (when component
-      (apply component :dispatch action args)
-      (component-state-tree component))))
+  "Dispatch an action to a component under the registry lock, capturing a
+   restorable snapshot first so the change is undoable and cannot interleave
+   with a concurrent surgery write — mirroring SURGERY-SET-STATE. Returns the
+   updated state tree, or NIL when COMPONENT-ID is not registered."
+  (lol-web/core:with-components-lock
+    (let ((component (find-component component-id)))
+      (when component
+        (capture-snapshot component "Before surgery")
+        (apply component :dispatch action args)
+        (component-state-tree component)))))
 
 ;;; ============================================================================
 ;;; SURGERY X-RAY COMPONENT
@@ -213,12 +225,25 @@
         (:div :class "xray-content"
           (cl-who:str inner-html))))))
 
+(defun %surgery-csrf-meta-tag ()
+  "Emit `<meta name=\"csrf-token\" content=\"...\">` for the current
+   session's CSRF token. Returns the empty string when no token is
+   resolvable (no session, csrf middleware not installed). The runtime
+   JS reads this tag at fetch time so token rotation propagates without
+   a panel re-render."
+  (let ((token (ignore-errors (lol-web/server:get-csrf-token))))
+    (if (and token (stringp token))
+        (format nil "<meta name=\"csrf-token\" content=\"~A\">"
+                (lol-web/escape:escape-attribute token))
+        "")))
+
 (defun surgery-panel-html (component)
   "Generate the surgery panel HTML for a component."
   (let* ((id (funcall component :id))
          (state-tree (component-state-tree component))
          (snapshots (list-snapshots id)))
     (cl-who:with-html-output-to-string (s)
+      (cl-who:str (%surgery-csrf-meta-tag))
       (:div :class "surgery-panel fixed right-0 top-0 h-full w-96 bg-brutal-surface border-l-4 border-brutal-accent p-4 overflow-y-auto z-50 transform translate-x-full transition-transform"
             :id (format nil "surgery-panel-~a" id)
             :data-for-component id
@@ -233,7 +258,7 @@
         ;; Component ID
         (:div :class "mb-4 text-brutal-muted text-sm"
           (:span :class "text-brutal-secondary" "ID: ")
-          (cl-who:str id))
+          (cl-who:esc (princ-to-string id)))
 
         ;; State Inspector
         (:div :class "mb-6"
@@ -245,27 +270,12 @@
                     (vtype (cdr (assoc :type var))))
                 (cl-who:htm
                  (:div :class "flex justify-between items-center py-1 border-b border-brutal-surface"
-                   (:span :class "text-brutal-accent" (cl-who:str key))
+                   (:span :class "text-brutal-accent" (cl-who:esc (princ-to-string key)))
                    (:span :class "text-brutal-text cursor-pointer hover:bg-brutal-surface px-2"
                           :onclick (parenscript:ps* `(funcall edit-state ,id ,key))
                           :data-state-key key
-                     (cl-who:str (format nil "~a" value)))
-                   (:span :class "text-brutal-muted text-xs" (cl-who:str vtype))))))))
-
-        ;; REPL Console
-        (:div :class "mb-6"
-          (:h4 :class "text-brutal-secondary font-bold mb-2" "REPL")
-          (:div :class "bg-brutal-bg border-2 border-brutal-primary"
-            (:div :class "p-2 max-h-32 overflow-y-auto font-mono text-xs"
-                  :id (format nil "repl-output-~a" id))
-            (:div :class "border-t border-brutal-primary flex"
-              (:span :class "text-brutal-primary p-2" ">")
-              (:input :type "text"
-                      :class "flex-1 bg-brutal-bg text-brutal-text px-2 py-2 font-mono text-sm focus:outline-none"
-                      :id (format nil "repl-input-~a" id)
-                      :placeholder "(setf name \"New\")"
-                      :onkeypress (parenscript:ps* `(when (string= (ps:@ event key) "Enter")
-                                                      (funcall eval-in-context ,id)))))))
+                     (cl-who:esc (format nil "~a" value)))
+                   (:span :class "text-brutal-muted text-xs" (cl-who:esc (princ-to-string vtype)))))))))
 
         ;; Snapshots
         (:div :class "mb-6"
@@ -308,27 +318,91 @@
 ;;; ============================================================================
 ;;; SURGERY MODE
 ;;;
-;;; Global toggle for surgery/x-ray mode.
+;;; surgery-middleware let-binds *surgery-mode* and
+;;; lol-web/html:*component-render-hook* per request so the toggle is
+;;; thread-local inside any middleware-gated request body. The
+;;; enable/disable pair stays usable from REPL/test (no middleware).
 ;;; ============================================================================
 
 (defparameter *surgery-mode* nil
-  "When true, all components render with x-ray wrappers.")
+  "Default surgery (x-ray) state read where no surgery-middleware
+   binding shadows it.")
+
+(defparameter *allow-global-surgery-enable* nil
+  "Global enable-surgery-mode opt-in. Prefer surgery-middleware.")
+
+(defparameter *surgery-production-env-var* "LOL_WEB_PRODUCTION"
+  "Name of the environment variable whose presence makes
+   ENABLE-SURGERY-MODE refuse. Guards only the image-global enable — the
+   per-request SURGERY-MIDDLEWARE path is unaffected.")
+
+(defparameter *surgery-enable-audit-hook* nil
+  "When non-NIL, a function of no arguments funcalled whenever
+   ENABLE-SURGERY-MODE installs the global render hook. A production image
+   sets this to log/alert so an accidental global enable is observable
+   rather than silent. SURGERY-MIDDLEWARE does not fire it.")
+
+(defun %surgery-production-p ()
+  "True iff the environment variable named by *SURGERY-PRODUCTION-ENV-VAR*
+   is set to a non-empty value."
+  (let ((v (uiop:getenv *surgery-production-env-var*)))
+    (and v (plusp (length v)))))
 
 (defun enable-surgery-mode ()
-  "Enable global surgery mode. Installs xray-wrapper-html as the
-   :lol-web/html component-render hook so every component->html call
-   produces a wrapper with the x-ray toggle."
+  "Set the *surgery-mode* default to T and install xray-wrapper-html as the
+   global *component-render-hook* — leaking per-component closure state into
+   every rendered response process-wide. Shadowed inside surgery-middleware.
+
+   Refuses when *ALLOW-GLOBAL-SURGERY-ENABLE* is NIL, and refuses outright
+   when the production env var (*SURGERY-PRODUCTION-ENV-VAR*) is set, so a
+   stray REPL enable cannot turn on the x-ray surface in a production image.
+   Fires *SURGERY-ENABLE-AUDIT-HOOK* on success."
+  (unless *allow-global-surgery-enable*
+    (error "enable-surgery-mode requires *allow-global-surgery-enable* to be T"))
+  (when (%surgery-production-p)
+    (error "enable-surgery-mode refused: ~A is set. Global surgery exposes ~
+            component closure state in every response; use surgery-middleware ~
+            for per-request, dynamically-scoped enablement instead."
+           *surgery-production-env-var*))
   (setf *surgery-mode* t)
-  (setf lol-web/html:*component-render-hook* #'xray-wrapper-html))
+  (setf lol-web/html:*component-render-hook* #'xray-wrapper-html)
+  (when *surgery-enable-audit-hook*
+    (funcall *surgery-enable-audit-hook*))
+  t)
 
 (defun disable-surgery-mode ()
-  "Disable global surgery mode and restore the default wrapper."
+  "Counterpart to enable-surgery-mode: clear both globals."
   (setf *surgery-mode* nil)
   (setf lol-web/html:*component-render-hook* nil))
 
 (defun surgery-mode-p ()
-  "Check if surgery mode is enabled."
+  "T iff surgery mode is active in the current dynamic extent."
   *surgery-mode*)
+
+(defun %default-surgery-decide (env)
+  "Default surgery-middleware decision: T iff session holds
+   :lol-web/surgery-mode -> T. NIL when no session is present."
+  (let ((session (getf env :lack.session)))
+    (when (hash-table-p session)
+      (eq t (gethash :lol-web/surgery-mode session)))))
+
+(defun surgery-middleware (app &key (decide #'%default-surgery-decide))
+  "Lack middleware that scopes *surgery-mode* and
+   lol-web/html:*component-render-hook* per request via CL dynamic
+   binding, so the toggle cannot leak between concurrent requests.
+
+   DECIDE is a one-argument function over the request env; T enables
+   surgery for this request, NIL disables. Default reads :lack.session
+   for an explicit :lol-web/surgery-mode entry, so the middleware must
+   sit downstream of session middleware in the Lack chain. The render
+   hook is bound to xray-wrapper-html when DECIDE returns T, NIL
+   otherwise — neither global is consulted inside the request body."
+  (lambda (env)
+    (let ((wants (and decide (funcall decide env))))
+      (let ((*surgery-mode*                       (and wants t))
+            (lol-web/html:*component-render-hook* (when wants
+                                                    #'xray-wrapper-html)))
+        (funcall app env)))))
 
 ;;; ============================================================================
 ;;; COMPONENT METADATA
@@ -348,51 +422,65 @@
   (gethash id *component-metadata*))
 
 ;;; ============================================================================
-;;; UNDO/REDO SYSTEM
-;;;
-;;; Track changes for undo functionality.
+;;; UNDO/REDO
 ;;; ============================================================================
 
-(defparameter *undo-stacks* (make-hash-table :test 'equal)
-  "Component ID -> list of previous states for undo.")
-
-(defparameter *redo-stacks* (make-hash-table :test 'equal)
-  "Component ID -> list of undone states for redo.")
-
 (defun push-undo (component)
-  "Push current state onto undo stack before a change."
-  (let* ((id (funcall component :id))
-         (state (funcall component :inspect)))
-    (push state (gethash id *undo-stacks*))
-    ;; Clear redo stack on new action
-    (setf (gethash id *redo-stacks*) nil)))
+  "Push current state onto the undo stack and clear redo. No-op when
+   COMPONENT is not registered. The read-modify-write over the undo and
+   redo stacks runs under the component registry lock, matching
+   SURGERY-UNDO/SURGERY-REDO so a frame cannot be lost to an interleave."
+  (lol-web/core:with-components-lock
+    (let* ((id (funcall component :id))
+           (entry (gethash id lol-web/core:*components*)))
+      (when entry
+        (let ((state (funcall component :inspect)))
+          (setf (lol-web/core:component-undo-stack id)
+                (%trim-stack (cons state (lol-web/core:component-undo-stack id))
+                             *max-undo-depth*))
+          (setf (lol-web/core:component-redo-stack id) nil))))))
 
 (defun can-undo-p (component-id)
   "Check if undo is available."
-  (not (null (gethash component-id *undo-stacks*))))
+  (not (null (lol-web/core:component-undo-stack component-id))))
 
 (defun can-redo-p (component-id)
   "Check if redo is available."
-  (not (null (gethash component-id *redo-stacks*))))
+  (not (null (lol-web/core:component-redo-stack component-id))))
 
 (defun surgery-undo (component-id)
-  "Undo the last change to a component."
-  (let ((component (find-component component-id)))
-    (when (and component (can-undo-p component-id))
-      (push (funcall component :inspect)
-            (gethash component-id *redo-stacks*))
-      (let ((prev-state (pop (gethash component-id *undo-stacks*))))
-        (dolist (pair (normalize-state-pairs (getf prev-state :state)))
-          (funcall component :set-state (car pair) (cdr pair))))
-      (component-state-tree component))))
+  "Undo the last change to a component. The read-modify-write across the
+   undo and redo stacks runs under *COMPONENTS-LOCK* so two concurrent undos
+   for the same ID cannot interleave and lose or duplicate a history frame."
+  (lol-web/core:with-components-lock
+    (let ((component (find-component component-id)))
+      (when (and component (can-undo-p component-id))
+        (let* ((current (funcall component :inspect))
+               (undo-stack (lol-web/core:component-undo-stack component-id))
+               (prev-state (first undo-stack)))
+          (setf (lol-web/core:component-redo-stack component-id)
+                (%trim-stack (cons current
+                                   (lol-web/core:component-redo-stack component-id))
+                             *max-redo-depth*))
+          (setf (lol-web/core:component-undo-stack component-id) (rest undo-stack))
+          (dolist (pair (normalize-state-pairs (getf prev-state :state)))
+            (funcall component :set-state (car pair) (cdr pair))))
+        (component-state-tree component)))))
 
 (defun surgery-redo (component-id)
-  "Redo a previously undone change."
-  (let ((component (find-component component-id)))
-    (when (and component (can-redo-p component-id))
-      (push (funcall component :inspect)
-            (gethash component-id *undo-stacks*))
-      (let ((next-state (pop (gethash component-id *redo-stacks*))))
-        (dolist (pair (normalize-state-pairs (getf next-state :state)))
-          (funcall component :set-state (car pair) (cdr pair))))
-      (component-state-tree component))))
+  "Redo a previously undone change. The read-modify-write runs under
+   *COMPONENTS-LOCK* for the same atomicity reason as SURGERY-UNDO."
+  (lol-web/core:with-components-lock
+    (let ((component (find-component component-id)))
+      (when (and component (can-redo-p component-id))
+        (let* ((current (funcall component :inspect))
+               (redo-stack (lol-web/core:component-redo-stack component-id))
+               (next-state (first redo-stack)))
+          (setf (lol-web/core:component-undo-stack component-id)
+                (%trim-stack (cons current
+                                   (lol-web/core:component-undo-stack component-id))
+                             *max-undo-depth*))
+          (setf (lol-web/core:component-redo-stack component-id) (rest redo-stack))
+          (dolist (pair (normalize-state-pairs (getf next-state :state)))
+            (funcall component :set-state (car pair) (cdr pair))))
+        (component-state-tree component)))))

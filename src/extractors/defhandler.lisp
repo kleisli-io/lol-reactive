@@ -121,9 +121,15 @@
          (method-form (getf defroute-options :method :get))
          ;; Pass-through options excluding :method (which we route through
          ;; the once-only g!method binding to keep evaluation count = 1).
+         ;; :auth and :internal are metadata-only annotations consumed by the
+         ;; OpenAPI emitter — defroute does not accept them, so filter them out
+         ;; of the forwarded list while keeping them in the metadata :options.
          (other-options (loop for (k v . rest) on defroute-options by #'cddr
                               unless (eq k :method)
-                              collect k and collect v)))
+                              collect k and collect v))
+         (defroute-options-filtered (loop for (k v . rest) on other-options by #'cddr
+                                          unless (member k '(:auth :internal))
+                                          collect k and collect v)))
     `(let ((,g!method ,method-form))
        (bordeaux-threads:with-recursive-lock-held (*handler-metadata-lock*)
          (setf (gethash (cons ,g!method ,g!path) *handler-metadata*)
@@ -131,8 +137,13 @@
                      :method ,g!method
                      :path ,g!path
                      :extractors (list ,@spec-construction-forms)
-                     :options (list :method ,g!method ,@other-options))))
-       (lol-web/server:defroute ,g!path (:method ,g!method ,@other-options)
+                     ;; Options are stored as data (the OpenAPI emitter reads
+                     ;; :auth / :internal as literals). Quote the static tail so
+                     ;; values like (\"bearerAuth\") aren't evaluated as function
+                     ;; calls; :method threads through the once-only g!method
+                     ;; binding to preserve its single-evaluation contract.
+                     :options (list* :method ,g!method ',other-options))))
+       (lol-web/server:defroute ,g!path (:method ,g!method ,@defroute-options-filtered)
          (let* (,@(loop for parsed in parsed-specs
                         for var in spec-vars
                         for ctor in spec-construction-forms

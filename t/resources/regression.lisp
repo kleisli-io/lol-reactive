@@ -29,6 +29,19 @@
     (is (not (lol-web/resources::resource-success-p err)))
     (is (not (lol-web/resources::resource-error-p success)))))
 
+(test regression-with-resource-idle-branch-does-not-fetch-twice
+  "with-resource renders loading for an idle state instead of calling the
+   fetch function again from a dead fallback branch."
+  (let ((calls 0))
+    (flet ((fetch-probe ()
+             (incf calls)
+             (lol-web/resources::make-resource-state :status :idle)))
+      (let ((html (lol-web/resources::with-resource (data (probe))
+                    (declare (ignore data))
+                    "done")))
+        (is (= 1 calls))
+        (is (search "Loading..." html))))))
+
 (test regression-resource-state-accessors
   "Constructor stores data/error/timestamp/params and accessors retrieve
    them — guards against accidental slot renames during refactors."
@@ -104,3 +117,24 @@
     (is (lol-web/resources::resource-error-p state))
     (is (search "not found"
                 (lol-web/resources::resource-state-error state)))))
+
+;;; ============================================================================
+;;; *resource-cache* is bounded — request-derived keys cannot OOM
+;;; ============================================================================
+
+(test regression-resource-cache-bounded
+  "*RESOURCE-CACHE* is a bounded LRU cache: cycling more distinct keys than
+   its cap evicts rather than grows without limit. The timestamp folded into
+   each (TIMESTAMP . DATA) value round-trips through get-cached-data."
+  (let ((lol-web/resources::*resource-cache*
+          (lol-web/core:make-bounded-cache :max-entries 4 :test 'equal)))
+    (dotimes (i 20)
+      (lol-web/resources::set-cached-data 'r (list i) i))
+    (is (<= (lol-web/core:bounded-cache-count
+             lol-web/resources::*resource-cache*)
+            4)
+        "cache must stay at or below its 4-entry cap after 20 distinct inserts")
+    ;; Timestamp-folded value round-trips: a freshly set datum reads back.
+    (lol-web/resources::set-cached-data 'r '(:fresh) 99)
+    (is (eql 99 (lol-web/resources::get-cached-data 'r '(:fresh)))
+        "get-cached-data must return the DATA half of the folded value")))

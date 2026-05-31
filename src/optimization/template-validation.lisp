@@ -269,6 +269,100 @@
       warnings)))
 
 ;;; ============================================================================
+;;; hx-on-* LINT — refuse dynamic event-handler payloads
+;;; ============================================================================
+;;;
+;;; HTMX's `:hx-on-<event>` attribute installs an inline JavaScript event
+;;; handler whose body is the attribute value. A non-literal value
+;;; (anything that has to be computed at request time) is an RCE surface
+;;; the moment any part of the computation flows from untrusted input,
+;;; even indirectly. The compile-time lint refuses non-literal values on
+;;; the attribute as written in the template — runtime computation must
+;;; route through a server-side handler bound to a stable literal attr.
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun %hx-on-attribute-p (key)
+    "True iff KEY is a cl-who-style :hx-on or :hx-on-... keyword."
+    (and (keywordp key)
+         (let ((name (symbol-name key)))
+           (or (string= name "HX-ON")
+               (and (>= (length name) 6)
+                    (string= name "HX-ON-" :end1 6))))))
+
+  (defun lint-hx-on-not-literal (sexp)
+    "Walk SEXP and return a list of warning strings for every
+     `:hx-on-*` (or `:hx-on`) attribute whose value is not a literal
+     string. A literal STRING is the only form whose semantics are
+     visible at template-load time; anything else escapes static review."
+    (let ((warnings nil))
+      (labels ((walk-html-element (x)
+                 ;; X is a cl-who form whose car is the tag keyword.
+                 ;; Iterate rest as a stream of either (KEYWORD VALUE)
+                 ;; attribute pairs or bare child forms; descend into
+                 ;; non-string children regardless of which slot they
+                 ;; sit in.
+                 (let ((rest (cdr x)))
+                   (loop while rest
+                         for k = (car rest)
+                         do (cond
+                              ((and (keywordp k) (cdr rest))
+                               (let ((v (cadr rest)))
+                                 (when (and (%hx-on-attribute-p k)
+                                            (not (stringp v)))
+                                   (let ((*print-case* :downcase))
+                                     (push (format nil
+                                                   "~S has non-literal value ~S — compile a server-bound handler instead"
+                                                   k v)
+                                           warnings)))
+                                 (when (consp v) (walk v)))
+                               (setf rest (cddr rest)))
+                              (t
+                               (when (consp k) (walk k))
+                               (setf rest (cdr rest)))))))
+               (walk (x)
+                 (when (consp x)
+                   (cond
+                     ((keywordp (car x))
+                      (walk-html-element x))
+                     (t
+                      (dolist (child x)
+                        (when (consp child) (walk child))))))))
+        (walk sexp))
+      (nreverse warnings))))
+
+;;; ============================================================================
+;;; UNSAFE CL-WHO:STR DETECTION
+;;; ============================================================================
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defparameter *safe-str-wrappers*
+    '(cl-who:esc cl-who:fmt escape-html safe-str
+      coerce-html-emit safe-html-string-value)
+    "Forms whose result is safe to emit verbatim via cl-who:str —
+     escapers, formatters, or an explicit unwrap of a tagged
+     safe-html-string.")
+
+  (defun find-str-of-unknown-input (sexp)
+    "Find (cl-who:str X) where X is neither a literal string nor a call
+     to one of *safe-str-wrappers*. Returns a list of warning strings."
+    (let ((warnings nil))
+      (labels ((walk (x)
+                 (when (consp x)
+                   (when (and (eq (car x) 'cl-who:str) (cdr x))
+                     (let ((arg (cadr x)))
+                       (unless (or (stringp arg)
+                                   (and (consp arg)
+                                        (member (car arg) *safe-str-wrappers*)))
+                         (push (format nil
+                                       "(cl-who:str ~S) emits unescaped — wrap with cl-who:esc, escape-html, safe-str, or coerce-html-emit"
+                                       arg)
+                               warnings))))
+                   (dolist (child (cdr x))
+                     (walk child)))))
+        (walk sexp))
+      (nreverse warnings))))
+
+;;; ============================================================================
 ;;; DEFVALIDATED-TEMPLATE MACRO
 ;;; ============================================================================
 
@@ -311,8 +405,13 @@
         (validate-css-classes-in-sexp html-form :strict nil)
         (let ((xss-warnings (find-dangerous-interpolation html-form)))
           (dolist (warning xss-warnings)
-            (warn "~A in template ~A: ~A" "XSS Warning" name warning)))))
-    ;; Validate token usage
+            (warn "~A in template ~A: ~A" "XSS Warning" name warning)))
+        (let ((str-warnings (find-str-of-unknown-input html-form)))
+          (dolist (warning str-warnings)
+            (warn "~A in template ~A: ~A" "Unsafe cl-who:str" name warning)))
+        (let ((hx-on-warnings (lint-hx-on-not-literal html-form)))
+          (dolist (warning hx-on-warnings)
+            (warn "~A in template ~A: ~A" "hx-on RCE" name warning)))))
     (validate-token-usage form))
   ;; Generate the runtime function (no validation overhead)
   `(defun ,name ,args

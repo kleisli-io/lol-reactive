@@ -22,13 +22,107 @@
 (defvar *forms* (make-hash-table :test 'eq)
   "Registry of defined forms.")
 
+(defparameter *form-pattern-max-length* 256
+  "Reject DEFFORM :PATTERN strings longer than this. Unbounded regex
+   strings are a cheap DoS vector — 256 is well above any legitimate
+   field-validation pattern.")
+
+(defparameter *form-pattern-compile-timeout-seconds* 0.1
+  "Wallclock cap on CL-PPCRE:CREATE-SCANNER calls for DEFFORM :PATTERN
+   compiles. Catastrophic-backtracking regex authors get bounded CPU;
+   legitimate patterns compile in microseconds.")
+
+(defparameter *form-pattern-cache-max-entries* 1024
+  "Element-count cap on *FORM-PATTERN-SCANNER-CACHE*. DEFFORM-declared
+   patterns are few, but hand-crafted specs passed to REGISTER-FORM at
+   runtime bypass the macro and can cycle distinct pattern strings; the
+   bound turns unbounded cache growth into LRU eviction.")
+
+(defvar *form-pattern-scanner-cache*
+  (lol-web/core:make-bounded-cache :max-entries *form-pattern-cache-max-entries*
+                                   :test 'equal)
+  "Memoization cache mapping pattern-string -> compiled CL-PPCRE scanner.
+   Populated lazily by %GET-FORM-PATTERN-SCANNER. A bounded LRU cache so a
+   stream of distinct runtime-registered patterns evicts rather than grows
+   without limit.")
+
+(defparameter *form-email-max-length* 254
+  "Server-side cap for :EMAIL fields before regex validation.")
+
+(defparameter *form-url-max-length* 2048
+  "Server-side cap for :URL fields before regex validation.")
+
+(defun %compile-form-pattern-bounded (pattern)
+  "Compile PATTERN to a CL-PPCRE scanner, refusing strings beyond
+   *FORM-PATTERN-MAX-LENGTH* and aborting compilations beyond
+   *FORM-PATTERN-COMPILE-TIMEOUT-SECONDS*. Signals on length, timeout,
+   or malformed-regex; the DEFFORM macro re-signals at the call site so
+   the misconfiguration surfaces at form-definition time, not at the
+   first request that hits the bad field."
+  (unless (stringp pattern)
+    (error "form-dsl :pattern must be a string; got ~S" pattern))
+  (when (> (length pattern) *form-pattern-max-length*)
+    (error "form-dsl :pattern length ~D exceeds *form-pattern-max-length* ~D"
+           (length pattern) *form-pattern-max-length*))
+  ;; Off SBCL there is no interruptible compile timer — refuse rather than run
+  ;; cl-ppcre:create-scanner unbounded on a catastrophic-backtracking pattern.
+  #-sbcl
+  (error "form-dsl :pattern ~S compile cannot be wallclock-bounded off SBCL; ~
+          refusing" pattern)
+  #+sbcl
+  (handler-case
+      (sb-ext:with-timeout *form-pattern-compile-timeout-seconds*
+        (cl-ppcre:create-scanner pattern))
+    (sb-ext:timeout ()
+      (error "form-dsl :pattern ~S compile exceeded ~A seconds"
+             pattern *form-pattern-compile-timeout-seconds*))
+    (error (e)
+      (error "form-dsl :pattern ~S is not a valid regex: ~A" pattern e))))
+
+(defun %get-form-pattern-scanner (pattern)
+  "Return the cached CL-PPCRE scanner for PATTERN, compiling under the
+   bounded primitive on first use. The cache is keyed by pattern string
+   and bounded by *FORM-PATTERN-CACHE-MAX-ENTRIES*; DEFFORM macro-expansion
+   ensures the cache only ever holds bounded-length, bounded-cost scanners."
+  (multiple-value-bind (scanner present-p)
+      (lol-web/core:bounded-cache-get *form-pattern-scanner-cache* pattern)
+    (if present-p
+        scanner
+        (lol-web/core:bounded-cache-set *form-pattern-scanner-cache* pattern
+                                        (%compile-form-pattern-bounded pattern)))))
+
+(define-condition unsafe-form-field-name (error)
+  ((name :initarg :name :reader unsafe-form-field-name-name))
+  (:report (lambda (c stream)
+             (format stream "Unsafe form field name ~S: must be an ASCII letter followed by ASCII letters, digits, `-`, or `_`."
+                     (unsafe-form-field-name-name c)))))
+
+(defun %safe-form-field-name-p (name)
+  "True when NAME prints as a conservative field-name token: an ASCII
+   letter followed by ASCII letters, digits, `-`, or `_`. The name flows
+   into an HTML attribute, a CSS/JS `[name='...']` selector, and an interned
+   keyword, so a quote, bracket, or whitespace must never reach it."
+  (flet ((alpha (c) (or (char<= #\a c #\z) (char<= #\A c #\Z)))
+         (alnum (c) (or (char<= #\a c #\z) (char<= #\A c #\Z) (char<= #\0 c #\9))))
+    (let ((s (string name)))
+      (and (plusp (length s))
+           (alpha (char s 0))
+           (every (lambda (c) (or (alnum c) (char= c #\-) (char= c #\_))) s)))))
+
 (defun register-form (name spec)
-  "Register a form specification for later rendering and validation."
-  (setf (gethash name *forms*) spec))
+  "Register a form specification for later rendering and validation.
+   Every field name is checked against the safe token class so it cannot
+   break out of the attribute / selector / keyword sinks it reaches."
+  (dolist (field-spec (getf spec :fields))
+    (let ((field-name (car field-spec)))
+      (unless (%safe-form-field-name-p field-name)
+        (error 'unsafe-form-field-name :name field-name))))
+  (setf (gethash name *forms*) (copy-tree spec)))
 
 (defun get-form-spec (name)
   "Retrieve a registered form specification."
-  (gethash name *forms*))
+  (let ((spec (gethash name *forms*)))
+    (when spec (copy-tree spec))))
 
 (defun list-forms ()
   "List all registered forms."
@@ -148,6 +242,23 @@
 ;;; SERVER-SIDE VALIDATION
 ;;; ============================================================================
 
+(defun %parse-form-number (value integerp)
+  "Parse VALUE (a string) as a form number. When INTEGERP, accept only a
+   whole integer with no trailing junk. Otherwise accept an integer or
+   decimal/exponent literal. Returns the number, or NIL when VALUE is not a
+   valid numeric literal — unlike PARSE-INTEGER with :junk-allowed t, this
+   never silently truncates `\"3.9\"` to 3 or accepts `\"12abc\"` as 12, so
+   the server agrees with the client's numeric validity."
+  (if integerp
+      (ignore-errors (parse-integer value :junk-allowed nil))
+      (when (lol-web/escape:%scan-bounded
+             "^[+-]?(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+             value)
+        (let ((*read-eval* nil)
+              (*read-default-float-format* 'double-float))
+          (let ((n (ignore-errors (read-from-string value))))
+            (and (realp n) n))))))
+
 (defun validate-field (field-spec value)
   "Validate a single field value against its specification.
    Returns NIL if valid, or a list of error messages."
@@ -170,15 +281,25 @@
       ;; Type-specific validation
       (case field-type
         (:email
-         (unless (cl-ppcre:scan "^[^@]+@[^@]+\\.[^@]+$" value)
-           (push "Invalid email address" errors)))
+         (cond
+           ((> (length value) *form-email-max-length*)
+            (push (format nil "Must be at most ~D characters"
+                          *form-email-max-length*)
+                  errors))
+           ((not (lol-web/escape:%scan-bounded "^[^@]+@[^@]+\\.[^@]+$" value))
+            (push "Invalid email address" errors))))
 
         (:url
-         (unless (cl-ppcre:scan "^https?://" value)
-           (push "Invalid URL (must start with http:// or https://)" errors)))
+         (cond
+           ((> (length value) *form-url-max-length*)
+            (push (format nil "Must be at most ~D characters"
+                          *form-url-max-length*)
+                  errors))
+           ((not (lol-web/escape:%scan-bounded "^https?://" value))
+            (push "Invalid URL (must start with http:// or https://)" errors))))
 
         ((:number :integer)
-         (let ((num (ignore-errors (parse-integer value :junk-allowed t))))
+         (let ((num (%parse-form-number value (eq field-type :integer))))
            (cond
              ((null num)
               (push "Must be a number" errors))
@@ -194,9 +315,12 @@
            (when (and max-val (> len max-val))
              (push (format nil "Must be at most ~A characters" max-val) errors)))))
 
-      ;; Pattern validation
+      ;; Pattern validation against the cached scanner. The pattern string
+      ;; was already length-and-compile-bounded by DEFFORM's macro-expansion
+      ;; (or by %GET-FORM-PATTERN-SCANNER's bounded compile on first hit
+      ;; for hand-crafted specs that bypass the macro).
       (when (and pattern (stringp value))
-        (unless (cl-ppcre:scan pattern value)
+        (unless (lol-web/escape:%scan-bounded (%get-form-pattern-scanner pattern) value)
           (push "Invalid format" errors)))
 
       ;; Custom validator
@@ -225,6 +349,14 @@
           (setf valid nil)
           (push (cons name field-errors) all-errors))))
     (values valid (nreverse all-errors))))
+
+(defun %form-csrf-valid-p (data)
+  "Return T when form submission DATA satisfies the current session CSRF gate.
+   Programmatic calls outside a request/session context stay valid."
+  (let ((session (and lol-web/server:*env*
+                      (getf lol-web/server:*env* :lack.session))))
+    (or (not session)
+        (validate-csrf-token (getf data :csrf-token)))))
 
 ;;; ============================================================================
 ;;; CLIENT-SIDE VALIDATION (PARENSCRIPT)
@@ -440,34 +572,58 @@
        :on-submit (register-user :username username :email email
                                  :password password :age age)
        :on-error (show-validation-errors errors))"
-  (let ((field-names (mapcar #'car fields))
-        (process-fn-name (symb "PROCESS-" name "-SUBMISSION")))
-    `(progn
-       ;; Register form spec
-       (register-form ',name
-                      '(:fields ,fields
-                        :on-submit ,on-submit
-                        :on-error ,on-error))
+  (dolist (field-spec fields)
+    (let ((pattern (getf (cdr field-spec) :pattern)))
+      (when pattern
+        ;; Validate at macro-expand: a too-long or pathological pattern
+        ;; signals here rather than at the first request that hits the
+        ;; field. The compiled scanner is discarded — VALIDATE-FIELD
+        ;; recomputes (and caches) it via %GET-FORM-PATTERN-SCANNER, so
+        ;; the cached scanner uses the application's runtime parameters
+        ;; rather than whatever value of *FORM-PATTERN-MAX-LENGTH* was
+        ;; bound during macro-expansion.
+        (%compile-form-pattern-bounded pattern))))
+  (let* ((field-names (mapcar #'car fields))
+         (process-fn-name (symb "PROCESS-" name "-SUBMISSION"))
+         (g-data (gensym "REQUEST-DATA-"))
+         (g-valid (gensym "VALID-"))
+         (g-errors (gensym "ERRORS-")))
+    (flet ((field-let-bindings (data-var)
+             (mapcar (lambda (fname)
+                       `(,fname (getf ,data-var
+                                      ,(intern (string-upcase fname) :keyword))))
+                     field-names)))
+      `(progn
+         ;; Register form spec. :on-submit / :on-error are compiled to closures
+         ;; at registration so the registry holds executable code, not source
+         ;; forms — and the bookkeeping bindings (gensymed below) can't be
+         ;; shadowed by a field named `errors` or `request-data`.
+         (register-form ',name
+                        (list :fields ',fields
+                              :on-submit
+                              (lambda (,g-data)
+                                (let* ,(field-let-bindings g-data)
+                                  ,on-submit))
+                              :on-error
+                              ,(when on-error
+                                 `(lambda (errors) ,on-error))))
 
-       ;; Define submission handler
-       (defun ,process-fn-name (request-data)
-         "Process form submission with validation.
-          REQUEST-DATA: Plist of form values
-          Returns: Result of on-submit handler or error handler"
-         (multiple-value-bind (valid errors)
-             (validate-form-data ',name request-data)
-           (if valid
-               (let (,@(mapcar (lambda (fname)
-                                 `(,fname (getf request-data
-                                               ,(intern (string-upcase fname) :keyword))))
-                               field-names))
-                 ,on-submit)
-               ,(if on-error
-                    `(let ((errors errors))
-                       ,on-error)
-                    `errors))))
+         ;; Submission handler delegates to the registered closures.
+         (defun ,process-fn-name (,g-data)
+           "Process form submission with validation.
+            Returns: result of :on-submit (when valid) or :on-error (when invalid),
+            falling back to the errors alist when no :on-error was supplied."
+           (unless (%form-csrf-valid-p ,g-data)
+             (error 'http-forbidden :body "Invalid or missing CSRF token"))
+           (multiple-value-bind (,g-valid ,g-errors)
+               (validate-form-data ',name ,g-data)
+             (if ,g-valid
+                 (funcall (getf (get-form-spec ',name) :on-submit) ,g-data)
+                 ,(if on-error
+                      `(funcall (getf (get-form-spec ',name) :on-error) ,g-errors)
+                      g-errors))))
 
-       ',name)))
+         ',name))))
 
 ;;; ============================================================================
 ;;; FORM STYLES
@@ -478,58 +634,59 @@
    The default render-form uses Tailwind classes. This function provides
    fallback CSS for the .has-errors class used by client-side validation.
    Only needed if you're not using Tailwind CDN."
-  (concatenate 'string
-    (css-section "Form Container"
-      (css-rule ".lol-form"
-                `(("max-width" . "500px"))))
-    (format nil "~%")
-    (css-section "Form Fields"
-      (css-rule ".form-field"
-                `(("margin-bottom" . ,(css-var "spacing-4"))))
-      (css-rule ".form-field label"
-                `(("display" . "block")
-                  ("margin-bottom" . ,(css-var "spacing-2"))
-                  ("font-weight" . "500")
-                  ("color" . ,(css-var "color-text"))))
-      (css-rule ".form-field input, .form-field textarea"
-                `(("width" . "100%")
-                  ("padding" . ,(css-var "spacing-2"))
-                  ("border" . ,(format nil "1px solid ~A" (css-var "color-muted")))
-                  ("border-radius" . ,(css-var "radius-md"))
-                  ("font-size" . "1rem")
-                  ("background" . ,(css-var "color-surface"))
-                  ("color" . ,(css-var "color-text"))))
-      (css-rule ".form-field input:focus, .form-field textarea:focus"
-                `(("outline" . "none")
-                  ("border-color" . ,(css-var "color-primary"))
-                  ("box-shadow" . ,(format nil "0 0 0 2px color-mix(in srgb, ~A 20%, transparent)"
-                                           (css-var "color-primary"))))))
-    (format nil "~%")
-    (css-section "Form Validation States"
-      (css-rule ".form-field.has-errors input, .form-field.has-errors textarea"
-                `(("border-color" . ,(css-var "color-error"))))
-      (css-rule ".form-field .required"
-                `(("color" . ,(css-var "color-error"))))
-      (css-rule ".form-field .field-error"
-                `(("display" . "block")
-                  ("color" . ,(css-var "color-error"))
-                  ("font-size" . "0.875rem")
-                  ("margin-top" . ,(css-var "spacing-1")))))
-    (format nil "~%")
-    (css-section "Form Actions"
-      (css-rule ".form-actions"
-                `(("margin-top" . ,(css-var "spacing-6"))))
-      (css-rule ".btn"
-                `(("padding" . ,(format nil "~A ~A" (css-var "spacing-2") (css-var "spacing-4")))
-                  ("border" . "none")
-                  ("border-radius" . ,(css-var "radius-md"))
-                  ("cursor" . "pointer")
-                  ("font-size" . "1rem")))
-      (css-rule ".btn-primary"
-                `(("background" . ,(css-var "color-primary"))
-                  ("color" . ,(css-var "color-surface"))))
-      (css-rule ".btn-primary:hover"
-                `(("filter" . "brightness(0.9)"))))))
+  (flet ((p (s) (make-safe-css-payload-string s)))
+    (concatenate 'string
+      (css-section (p "Form Container")
+        (p (css-rule ".lol-form"
+                     `(("max-width" . "500px")))))
+      (format nil "~%")
+      (css-section (p "Form Fields")
+        (p (css-rule ".form-field"
+                     `(("margin-bottom" . ,(css-var "spacing-4")))))
+        (p (css-rule ".form-field label"
+                     `(("display" . "block")
+                       ("margin-bottom" . ,(css-var "spacing-2"))
+                       ("font-weight" . "500")
+                       ("color" . ,(css-var "color-text")))))
+        (p (css-rule ".form-field input, .form-field textarea"
+                     `(("width" . "100%")
+                       ("padding" . ,(css-var "spacing-2"))
+                       ("border" . ,(format nil "1px solid ~A" (css-var "color-muted")))
+                       ("border-radius" . ,(css-var "radius-md"))
+                       ("font-size" . "1rem")
+                       ("background" . ,(css-var "color-surface"))
+                       ("color" . ,(css-var "color-text")))))
+        (p (css-rule ".form-field input:focus, .form-field textarea:focus"
+                     `(("outline" . "none")
+                       ("border-color" . ,(css-var "color-primary"))
+                       ("box-shadow" . ,(format nil "0 0 0 2px color-mix(in srgb, ~A 20%, transparent)"
+                                                (css-var "color-primary")))))))
+      (format nil "~%")
+      (css-section (p "Form Validation States")
+        (p (css-rule ".form-field.has-errors input, .form-field.has-errors textarea"
+                     `(("border-color" . ,(css-var "color-error")))))
+        (p (css-rule ".form-field .required"
+                     `(("color" . ,(css-var "color-error")))))
+        (p (css-rule ".form-field .field-error"
+                     `(("display" . "block")
+                       ("color" . ,(css-var "color-error"))
+                       ("font-size" . "0.875rem")
+                       ("margin-top" . ,(css-var "spacing-1"))))))
+      (format nil "~%")
+      (css-section (p "Form Actions")
+        (p (css-rule ".form-actions"
+                     `(("margin-top" . ,(css-var "spacing-6")))))
+        (p (css-rule ".btn"
+                     `(("padding" . ,(format nil "~A ~A" (css-var "spacing-2") (css-var "spacing-4")))
+                       ("border" . "none")
+                       ("border-radius" . ,(css-var "radius-md"))
+                       ("cursor" . "pointer")
+                       ("font-size" . "1rem"))))
+        (p (css-rule ".btn-primary"
+                     `(("background" . ,(css-var "color-primary"))
+                       ("color" . ,(css-var "color-surface")))))
+        (p (css-rule ".btn-primary:hover"
+                     `(("filter" . "brightness(0.9)"))))))))
 
 ;;; ============================================================================
 ;;; FORM INTROSPECTION

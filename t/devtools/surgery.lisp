@@ -11,14 +11,16 @@
     (disable-surgery-mode)
     (is (not (surgery-mode-p)))
 
-    (enable-surgery-mode)
+    (let ((lol-web/devtools::*allow-global-surgery-enable* t))
+      (enable-surgery-mode))
     (is (surgery-mode-p))
 
     (disable-surgery-mode)
     (is (not (surgery-mode-p)))
 
     (if initial-state
-        (enable-surgery-mode)
+        (let ((lol-web/devtools::*allow-global-surgery-enable* t))
+          (enable-surgery-mode))
         (disable-surgery-mode))))
 
 (test surgery-mode-p-returns-boolean

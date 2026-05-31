@@ -10,8 +10,10 @@
   outputs = { self, nixpkgs, cl-deps, ... }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
-        "x86_64-linux" "aarch64-linux"
-        "x86_64-darwin" "aarch64-darwin"
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
       ];
 
       ## Map module-table.nix's external-deps names onto the cl-deps lisp
@@ -21,18 +23,19 @@
       ## bridges the two vocabularies.
       mkLispDepsByName = lisp: with lisp; {
         inherit alexandria iterate cl-ppcre babel
-                ironclad bordeaux-threads
-                let-over-lambda
-                cl-who parenscript jzon hunchentoot
-                flexi-streams puri
-                clack clack-handler-hunchentoot
-                websocket-driver-server;
-        lack-core         = lack;
-        clack-session     = lack-middleware-session;
-        clack-csrf        = lack-middleware-csrf;
-        clack-static      = lack-middleware-static;
-        clack-accesslog   = lack-middleware-accesslog;
-        clack-cors        = lack-middleware-cors;
+          ironclad bordeaux-threads
+          let-over-lambda
+          cl-who parenscript jzon hunchentoot
+          flexi-streams puri
+          clack clack-handler-hunchentoot
+          websocket-driver-server
+          lack-test;
+        lack-core = lack;
+        clack-session = lack-middleware-session;
+        clack-csrf = lack-middleware-csrf;
+        clack-static = lack-middleware-static;
+        clack-accesslog = lack-middleware-accesslog;
+        clack-cors = lack-middleware-cors;
       };
 
       ## Build per system. `built.library` is the umbrella derivation with
@@ -44,13 +47,14 @@
           inherit (cl-deps.lib.${system}) buildLisp lisp;
           pkgs = nixpkgs.legacyPackages.${system};
         in
-          import ./nix/build.nix {
-            inherit buildLisp pkgs;
-            srcDir = ./.;
-            lispDepsByName = mkLispDepsByName lisp;
-            testDeps = [ lisp.fiveam ];
-          };
-    in {
+        import ./nix/build.nix {
+          inherit buildLisp pkgs;
+          srcDir = ./.;
+          lispDepsByName = mkLispDepsByName lisp;
+          testDeps = [ lisp.fiveam ];
+        };
+    in
+    {
       lib = forAllSystems (system: {
         library = (buildFor system).library;
         modules = (buildFor system).modules;
@@ -73,9 +77,9 @@
             (name: drv: nixpkgs.lib.nameValuePair "module-${name}" drv)
             built.modules;
         in
-          moduleChecks // {
-            library    = built.library;
-            asdf-drift = built.library.asdfDriftCheck;
-          });
+        moduleChecks // {
+          library = built.library;
+          asdf-drift = built.library.asdfDriftCheck;
+        });
     };
 }

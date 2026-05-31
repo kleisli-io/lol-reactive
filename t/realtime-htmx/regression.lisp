@@ -64,3 +64,115 @@
     (is (stringp js))
     (is (> (length js) 100)
         "optimistic-js must compile to a substantive JS payload")))
+
+;;; ============================================================================
+;;; optimistic-apply-payload — safe-html-string boundary check
+;;; ============================================================================
+
+(defun %signals-error-p (thunk)
+  (handler-case (progn (funcall thunk) nil)
+    (error () t)))
+
+(test regression-optimistic-rejects-unsafe-html
+  "optimistic-apply-payload refuses a bare string under :html — the
+   producer must wrap trusted markup in safe-html-string at the
+   boundary or the call signals."
+  (let* ((id "comp-unsafe")
+         (closure (lambda (msg &rest args) (declare (ignore msg args)) nil)))
+    (lol-web/core:register-component id closure)
+    (unwind-protect
+        (progn
+          (is (%signals-error-p
+               (lambda ()
+                 (lol-web/realtime-htmx:optimistic-apply-payload
+                  id '(:html "<script>1</script>")))))
+          ;; Positive path: tagged safe-html-string is unwrapped to its
+          ;; raw wire form in the returned plist.
+          (let ((wire (lol-web/realtime-htmx:optimistic-apply-payload
+                       id `(:html ,(lol-web/html:make-safe-html-string "<b>x</b>")))))
+            (is (string= "<b>x</b>" (getf wire :html)))))
+      (lol-web/core:unregister-component id))))
+
+(test regression-originals-tied-to-registration-lifetime
+  "component-originals lives on the component-entry struct, so
+   unregister-component drops the entire history. A re-registration
+   under the same id starts with an empty store — no leak between
+   instance lifetimes."
+  (let* ((id "comp-orig-life")
+         (closure (lambda (msg &rest args) (declare (ignore msg args)) nil)))
+    (lol-web/core:register-component id closure)
+    (is (eq :ok
+            (lol-web/realtime-htmx:optimistic-record-original
+             id '(:html "<b>1</b>"))))
+    (is (eq :ok
+            (lol-web/realtime-htmx:optimistic-record-original
+             id '(:html "<b>2</b>"))))
+    (is (= 2 (length (lol-web/core:component-originals id))))
+    (lol-web/core:unregister-component id)
+    (is (null (lol-web/core:component-originals id))
+        "originals are gone with the component-entry")
+    (is (eq :no-component
+            (lol-web/realtime-htmx:optimistic-record-original
+             id '(:html "<b>3</b>")))
+        "recording on an unregistered id is a silent :no-component result")
+    (is (null (lol-web/realtime-htmx:optimistic-clear-originals id))
+        "clearing an unregistered id reports that no component was cleared")
+    ;; Re-register: store starts empty, regardless of pre-unregister content.
+    (lol-web/core:register-component id closure)
+    (unwind-protect
+        (progn
+          (is (null (lol-web/core:component-originals id))
+              "re-registered instance starts with an empty originals store")
+          (lol-web/realtime-htmx:optimistic-record-original
+           id '(:html "<b>fresh</b>"))
+          (is (= 1 (length (lol-web/core:component-originals id)))))
+      (lol-web/core:unregister-component id))))
+
+(test regression-originals-cap-refuses-once-full
+  "optimistic-record-original returns :cap-reached when the per-component
+   store hits *optimistic-originals-cap*. The cap is a small constant in
+   the test so the loop runs deterministically."
+  (let* ((id "comp-cap")
+         (closure (lambda (msg &rest args) (declare (ignore msg args)) nil))
+         (lol-web/realtime-htmx:*optimistic-originals-cap* 3))
+    (lol-web/core:register-component id closure)
+    (unwind-protect
+        (progn
+          (dotimes (i 3)
+            (is (eq :ok
+                    (lol-web/realtime-htmx:optimistic-record-original
+                     id (list :html "<b>x</b>")))))
+          (is (eq :cap-reached
+                  (lol-web/realtime-htmx:optimistic-record-original
+                   id '(:html "<b>over</b>")))))
+      (lol-web/core:unregister-component id))))
+
+;;; ============================================================================
+;;; Optimistic originals — global cap across components
+;;; ============================================================================
+
+(test regression-optimistic-originals-global-cap-fires
+  "Two components each well under the per-component cap can together
+   reach the global cap; the next record is denied with
+   :global-cap-reached so the global ceiling is enforced."
+  (let* ((lol-web/realtime-htmx:*optimistic-originals-cap* 100)
+         (lol-web/realtime-htmx:*optimistic-originals-global-cap* 4)
+         (id-a "regression-optimistic-global-a")
+         (id-b "regression-optimistic-global-b")
+         (probe (lambda (msg &rest args)
+                  (declare (ignore args))
+                  (ecase msg (:id "stub") (:inspect '(:state ()))))))
+    (lol-web/core:register-component id-a probe)
+    (lol-web/core:register-component id-b probe)
+    (unwind-protect
+         (progn
+           (lol-web/realtime-htmx:optimistic-record-original id-a '(:html "<b/>"))
+           (lol-web/realtime-htmx:optimistic-record-original id-a '(:html "<b/>"))
+           (lol-web/realtime-htmx:optimistic-record-original id-b '(:html "<b/>"))
+           (lol-web/realtime-htmx:optimistic-record-original id-b '(:html "<b/>"))
+           (is (eq :global-cap-reached
+                   (lol-web/realtime-htmx:optimistic-record-original
+                    id-a '(:html "<b/>")))
+               "fifth record across components must trip the global cap"))
+      (lol-web/core:unregister-component id-a)
+      (lol-web/core:unregister-component id-b))))

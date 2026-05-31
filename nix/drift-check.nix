@@ -4,7 +4,8 @@ let
   generated = import ./asdf.nix { inherit pkgs; };
   static = srcDir + "/lol-web.asd";
 in
-pkgs.runCommand "lol-web-asd-drift-check" {
+pkgs.runCommand "lol-web-asd-drift-check"
+{
   passthru = { inherit generated; };
 } ''
   if ! diff -u ${static} ${generated}; then

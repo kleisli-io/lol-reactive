@@ -11,6 +11,8 @@
                 :pandoriclet :with-pandoric
                 :dlambda :defmacro!
                 :symb)
+  (:import-from :lol-web/crypto
+                #:random-bytes-hex)
   (:export
    ;; signals.lisp
    #:*current-effect*
@@ -19,7 +21,22 @@
    #:make-computed
    #:batch
    #:with-lol-web-thread-safety
+   #:with-reactive-context
    #:make-pandoric-signal
+   ;; bounded-cache.lisp
+   #:bounded-cache
+   #:bounded-cache-p
+   #:make-bounded-cache
+   #:bounded-cache-count
+   #:bounded-cache-get
+   #:bounded-cache-set
+   #:bounded-cache-remove
+   #:bounded-cache-clear
+   #:bounded-cache-keys
+   ;; cycle-safe-printer.lisp
+   #:with-cycle-safe-printer
+   #:bounded-serialize
+   #:*serialize-truncation-marker*
    ;; state.lisp
    #:make-store
    #:make-evolving-component
@@ -33,6 +50,12 @@
    #:register-component
    #:unregister-component
    #:find-component
+   #:component-principal-binding
+   #:component-snapshots
+   #:component-undo-stack
+   #:component-redo-stack
+   #:component-originals
+   #:with-components-lock
    #:generate-component-id
    #:*components*
    ;; composition/props.lisp

@@ -24,11 +24,17 @@
 (defvar *resources* (make-hash-table :test 'eq)
   "Registry of defined resources.")
 
-(defvar *resource-cache* (make-hash-table :test 'equal)
-  "In-memory cache for resource data.")
+(defparameter *resource-cache-max-entries* 1024
+  "Element-count cap on *RESOURCE-CACHE*. Request-derived params can cycle
+   distinct cache keys, so the bound turns unbounded growth into LRU
+   eviction rather than OOM.")
 
-(defvar *resource-cache-timestamps* (make-hash-table :test 'equal)
-  "Timestamps for cached resource data.")
+(defvar *resource-cache*
+  (lol-web/core:make-bounded-cache :max-entries *resource-cache-max-entries*
+                                   :test 'equal)
+  "Bounded LRU cache for resource data. Each value is (TIMESTAMP . DATA) so
+   the fetch time travels with the datum and eviction is atomic — no parallel
+   timestamp table to fall out of sync with the data table.")
 
 (defun register-resource (name spec)
   "Register a resource specification."
@@ -86,41 +92,37 @@
 (defun get-cached-data (resource-name params &key (max-age nil))
   "Get cached data if available and not expired.
    MAX-AGE: Maximum age in seconds (nil = no expiry)"
-  (let* ((key (make-cache-key resource-name params))
-         (data (gethash key *resource-cache*))
-         (timestamp (gethash key *resource-cache-timestamps*)))
-    (when (and data timestamp)
-      (if (or (null max-age)
-              (<= (- (get-universal-time) timestamp) max-age))
-          data
-          (progn
-            ;; Cache expired, remove it
-            (remhash key *resource-cache*)
-            (remhash key *resource-cache-timestamps*)
-            nil)))))
+  (let ((key (make-cache-key resource-name params)))
+    (multiple-value-bind (entry present-p)
+        (lol-web/core:bounded-cache-get *resource-cache* key)
+      (when present-p
+        (destructuring-bind (timestamp . data) entry
+          (if (or (null max-age)
+                  (<= (- (get-universal-time) timestamp) max-age))
+              data
+              ;; Cache expired, remove it
+              (progn
+                (lol-web/core:bounded-cache-remove *resource-cache* key)
+                nil)))))))
 
 (defun set-cached-data (resource-name params data)
-  "Store data in cache."
+  "Store data in cache, stamping the current time alongside it."
   (let ((key (make-cache-key resource-name params)))
-    (setf (gethash key *resource-cache*) data
-          (gethash key *resource-cache-timestamps*) (get-universal-time))))
+    (lol-web/core:bounded-cache-set *resource-cache* key
+                                    (cons (get-universal-time) data))
+    data))
 
 (defun clear-resource-cache (&optional resource-name)
   "Clear cached data, optionally for specific resource."
   (if resource-name
       ;; Clear specific resource
       (let ((prefix (format nil "~A:" resource-name)))
-        (maphash (lambda (k v)
-                   (declare (ignore v))
-                   (when (and (stringp k) (>= (length k) (length prefix))
-                              (string= prefix (subseq k 0 (length prefix))))
-                     (remhash k *resource-cache*)
-                     (remhash k *resource-cache-timestamps*)))
-                 *resource-cache*))
+        (dolist (k (lol-web/core:bounded-cache-keys *resource-cache*))
+          (when (and (stringp k) (>= (length k) (length prefix))
+                     (string= prefix (subseq k 0 (length prefix))))
+            (lol-web/core:bounded-cache-remove *resource-cache* k))))
       ;; Clear all
-      (progn
-        (clrhash *resource-cache*)
-        (clrhash *resource-cache-timestamps*))))
+      (lol-web/core:bounded-cache-clear *resource-cache*)))
 
 ;;; ============================================================================
 ;;; RESOURCE FETCHING
@@ -293,12 +295,7 @@
           (let ((,data-var (resource-state-data ,state-var)))
             ,@body))
          (t
-          ;; Idle state - trigger fetch
-          (setf ,state-var (,fetch-fn ,@resource-params))
-          (if (resource-success-p ,state-var)
-              (let ((,data-var (resource-state-data ,state-var)))
-                ,@body)
-              (render-resource-error ',resource-name (resource-state-error ,state-var))))))))
+          (render-resource-loading ',resource-name))))))
 
 ;;; ============================================================================
 ;;; RESOURCE STYLES
@@ -308,37 +305,38 @@
   "OPTIONAL: CSS for projects NOT using Tailwind.
    The default render functions use Tailwind classes. This function provides
    fallback CSS with CSS variables for non-Tailwind projects."
-  (concatenate 'string
-    (css-section "Resource Loading"
-      (css-rule ".resource-loading"
-                `(("padding" . ,(css-var "spacing-4"))
-                  ("text-align" . "center")
-                  ("color" . ,(css-var "color-muted"))))
-      (css-rule ".resource-loading .spinner"
-                `(("display" . "inline-block")
-                  ("width" . "20px")
-                  ("height" . "20px")
-                  ("border" . ,(format nil "2px solid ~A" (css-var "color-muted")))
-                  ("border-top-color" . ,(css-var "color-primary"))
-                  ("border-radius" . "50%")
-                  ("animation" . "lol-spin 1s linear infinite")
-                  ("margin-right" . ,(css-var "spacing-2"))
-                  ("vertical-align" . "middle"))))
-    (format nil "~%")
-    (css-keyframes "lol-spin"
-      '("to" . (("transform" . "rotate(360deg)"))))
-    (format nil "~%")
-    (css-section "Resource Error"
-      (css-rule ".resource-error"
-                `(("padding" . ,(css-var "spacing-4"))
-                  ("background" . ,(format nil "color-mix(in srgb, ~A 10%, ~A)"
-                                           (css-var "color-error")
-                                           (css-var "color-surface")))
-                  ("border" . ,(format nil "1px solid color-mix(in srgb, ~A 30%, ~A)"
-                                       (css-var "color-error")
-                                       (css-var "color-surface")))
-                  ("border-radius" . ,(css-var "radius-md"))
-                  ("color" . ,(css-var "color-error")))))))
+  (flet ((p (s) (make-safe-css-payload-string s)))
+    (concatenate 'string
+      (css-section (p "Resource Loading")
+        (p (css-rule ".resource-loading"
+                     `(("padding" . ,(css-var "spacing-4"))
+                       ("text-align" . "center")
+                       ("color" . ,(css-var "color-muted")))))
+        (p (css-rule ".resource-loading .spinner"
+                     `(("display" . "inline-block")
+                       ("width" . "20px")
+                       ("height" . "20px")
+                       ("border" . ,(format nil "2px solid ~A" (css-var "color-muted")))
+                       ("border-top-color" . ,(css-var "color-primary"))
+                       ("border-radius" . "50%")
+                       ("animation" . "lol-spin 1s linear infinite")
+                       ("margin-right" . ,(css-var "spacing-2"))
+                       ("vertical-align" . "middle")))))
+      (format nil "~%")
+      (css-keyframes "lol-spin"
+        '("to" . (("transform" . "rotate(360deg)"))))
+      (format nil "~%")
+      (css-section (p "Resource Error")
+        (p (css-rule ".resource-error"
+                     `(("padding" . ,(css-var "spacing-4"))
+                       ("background" . ,(format nil "color-mix(in srgb, ~A 10%, ~A)"
+                                                (css-var "color-error")
+                                                (css-var "color-surface")))
+                       ("border" . ,(format nil "1px solid color-mix(in srgb, ~A 30%, ~A)"
+                                            (css-var "color-error")
+                                            (css-var "color-surface")))
+                       ("border-radius" . ,(css-var "radius-md"))
+                       ("color" . ,(css-var "color-error")))))))))
 
 ;;; ============================================================================
 ;;; RESOURCE INTROSPECTION
@@ -360,12 +358,11 @@
   (let ((count 0)
         (total-age 0)
         (now (get-universal-time)))
-    (maphash (lambda (k v)
-               (declare (ignore v))
-               (incf count)
-               (let ((timestamp (gethash k *resource-cache-timestamps*)))
-                 (when timestamp
-                   (incf total-age (- now timestamp)))))
-             *resource-cache*)
+    (dolist (k (lol-web/core:bounded-cache-keys *resource-cache*))
+      (multiple-value-bind (entry present-p)
+          (lol-web/core:bounded-cache-get *resource-cache* k)
+        (when present-p
+          (incf count)
+          (incf total-age (- now (car entry))))))
     (list :cached-items count
           :average-age-seconds (if (> count 0) (/ total-age count) 0))))

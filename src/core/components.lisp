@@ -11,23 +11,128 @@
 (defparameter *components* (make-hash-table :test 'equal)
   "Registry of all component instances by ID.")
 
-(declaim (type fixnum *component-counter*))
-(sb-ext:defglobal *component-counter* 0
-  "Monotonic counter for auto-generated component IDs. Bumped via
-   sb-ext:atomic-incf so concurrent component construction never
-   produces colliding IDs.")
+(defvar *components-lock* (bordeaux-threads:make-recursive-lock "lol-web components registry")
+  "Serialises component registry reads/writes AND every component state
+   mutation (:set-state / :dispatch / surgery), so a surgery op cannot
+   interleave with ordinary dispatch traffic and tear a snapshot.")
 
-(defun register-component (id component)
-  "Register a component in the global registry."
-  (setf (gethash id *components*) component))
+(defvar *deferred-notifications* nil
+  "Bound by the OUTERMOST WITH-COMPONENTS-LOCK frame to a one-element list
+   whose car accumulates (component . subscribers) pairs. They are delivered
+   AFTER that frame releases *COMPONENTS-LOCK*, so NOTIFY-SUBSCRIBERS never
+   runs while the lock is held — even when a surgery op (holding the lock)
+   nests an ordinary :set-state. NIL outside any frame.")
+
+(defmacro! with-components-lock (&body body)
+  "Hold *COMPONENTS-LOCK* across BODY so a compound read-modify-write over a
+   component's registry entry or state slot is atomic with respect to
+   concurrent registry operations and other mutations. The lock is recursive,
+   so per-accessor acquisitions inside BODY nest harmlessly.
+
+   Subscriber notifications queued via %NOTIFY-OR-DEFER during BODY are held
+   until the outermost frame releases the lock, then delivered, so a
+   subscriber that takes a second lock cannot ABBA-deadlock against the
+   component lock."
+  `(let* ((,g!outermost (null *deferred-notifications*))
+          (*deferred-notifications* (or *deferred-notifications* (list nil))))
+     (if ,g!outermost
+         (multiple-value-prog1
+             (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+               ,@body)
+           (%flush-deferred-notifications))
+         (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+           ,@body))))
+
+(defstruct (component-entry (:conc-name %component-entry-))
+  "Registry entry: component closure, opaque principal-binding gating
+   ownership, and four mutable per-instance stacks that die with
+   UNREGISTER-COMPONENT. ORIGINALS is the optimistic-update rollback
+   store keyed by the per-element id the client invents at apply time."
+  (component         nil :read-only t)
+  (principal-binding nil :read-only t)
+  (snapshots         nil)
+  (undo-stack        nil)
+  (redo-stack        nil)
+  (originals         nil))
+
+(defun register-component (id component &key principal-binding)
+  "Register COMPONENT under ID. PRINCIPAL-BINDING is an opaque
+   consumer-supplied value compared by EQUAL against the current
+   request's principal at lookup time. NIL ⇒ no ownership check."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (setf (gethash id *components*)
+          (make-component-entry :component component
+                                :principal-binding principal-binding)))
+  component)
 
 (defun find-component (id)
-  "Find a component by ID."
-  (gethash id *components*))
+  "Find a component closure by ID, or NIL if absent."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (%component-entry-component entry)))))
+
+(defun component-principal-binding (id)
+  "Return the opaque principal-binding stored under ID, or NIL."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (%component-entry-principal-binding entry)))))
+
+(defun component-snapshots (id)
+  "Snapshot list for ID, or NIL if unregistered."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (%component-entry-snapshots entry)))))
+
+(defun (setf component-snapshots) (value id)
+  "No-op when ID is unregistered; returns VALUE either way."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (setf (%component-entry-snapshots entry) value))
+      value)))
+
+(defun component-undo-stack (id)
+  "Undo stack for ID, or NIL if unregistered."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (%component-entry-undo-stack entry)))))
+
+(defun (setf component-undo-stack) (value id)
+  "No-op when ID is unregistered; returns VALUE either way."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (setf (%component-entry-undo-stack entry) value))
+      value)))
+
+(defun component-redo-stack (id)
+  "Redo stack for ID, or NIL if unregistered."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (%component-entry-redo-stack entry)))))
+
+(defun (setf component-redo-stack) (value id)
+  "No-op when ID is unregistered; returns VALUE either way."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (setf (%component-entry-redo-stack entry) value))
+      value)))
+
+(defun component-originals (id)
+  "Optimistic-update originals store for ID, or NIL if unregistered."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (%component-entry-originals entry)))))
+
+(defun (setf component-originals) (value id)
+  "No-op when ID is unregistered; returns VALUE either way."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (let ((entry (gethash id *components*)))
+      (when entry (setf (%component-entry-originals entry) value))
+      value)))
 
 (defun unregister-component (id)
-  "Remove a component from the registry."
-  (remhash id *components*))
+  "Remove a component from the registry; entry slots are released."
+  (bordeaux-threads:with-recursive-lock-held (*components-lock*)
+    (remhash id *components*)))
 
 ;;; ============================================================================
 ;;; COMPONENT PROTOCOL
@@ -51,8 +156,20 @@
              body))
 
   (defun generate-component-id (component-name)
-    "Generate a unique component ID via an atomic monotonic counter."
-    (format nil "~a-~a" component-name (sb-ext:atomic-incf *component-counter*))))
+    "Generate a CSPRNG-backed component ID. 128 bits of entropy from the
+     OS CSPRNG so a component instance is not enumerable from its
+     prefix."
+    (format nil "~a-~a" component-name (random-bytes-hex 16)))
+
+  (defun %extract-leading-declares (body)
+    "Split BODY into (values DECLARES REST), peeling leading (declare ...)
+     forms off the front so callers can place them in a valid declaration
+     position (top of a lambda/let body, not inside a progn)."
+    (loop for tail on body
+          for form = (car tail)
+          while (and (consp form) (eq (car form) 'declare))
+          collect form into declares
+          finally (return (values declares tail)))))
 
 (defmacro! defcomponent (name (&rest state-vars) &body body)
   "Define a reactive component using pandoric closures.
@@ -99,38 +216,50 @@
                            `(error "No :render handler defined")))
 
                      (:state (key)
+                      ;; Case labels carry both the bare symbol (direct Lisp
+                      ;; callers, surgery) and the same-name keyword (callers
+                      ;; routing untrusted strings through SAFE-COERCE-KEYWORD).
                       (case key
                         ,@(mapcar (lambda (name)
-                                    `((,name) ,name))
+                                    `((,name ,(intern (symbol-name name) :keyword))
+                                      ,name))
                                   state-names)
                         (t (error "Unknown state key: ~a" key))))
 
                      (:set-state (key value)
                       (case key
                         ,@(mapcar (lambda (name)
-                                    `((,name)
-                                      (setf ,name value)
-                                      (notify-subscribers ,g!self subscribers)
+                                    `((,name ,(intern (symbol-name name) :keyword))
+                                      (with-components-lock
+                                        (setf ,name value)
+                                        (%notify-or-defer ,g!self (copy-list subscribers)))
                                       value))
                                   state-names)
                         (t (error "Unknown state key: ~a" key))))
 
-                     ;; Use the user's exact parameter names from their dispatch form
+                     ;; Lift leading (declare ...) forms out of user-body so they land
+                     ;; at the top of the dispatch lambda body (a valid declaration
+                     ;; position) rather than inside the inner progn (which is not).
                      ,(if dispatch-form
-                          (let ((user-params (cadr dispatch-form))  ; (action &rest args)
-                                (user-body (cddr dispatch-form)))   ; ((case action ...))
-                            `(:dispatch ,user-params
-                              (let ((result (progn ,@user-body)))
-                                (notify-subscribers ,g!self subscribers)
-                                result)))
+                          (let ((user-params (cadr dispatch-form))
+                                (user-body (cddr dispatch-form)))
+                            (multiple-value-bind (decls rest)
+                                (%extract-leading-declares user-body)
+                              `(:dispatch ,user-params
+                                ,@decls
+                                (with-components-lock
+                                  (let ((,g!result (progn ,@rest)))
+                                    (%notify-or-defer ,g!self (copy-list subscribers))
+                                    ,g!result)))))
                           `(:dispatch (action &rest args)
                             (error "No :dispatch handler defined")))
 
                      (:subscribe (callback)
-                      (push callback subscribers)
+                      (with-components-lock (push callback subscribers))
                       ;; Return unsubscribe function (a closure!)
                       (lambda ()
-                        (setf subscribers (remove callback subscribers))))
+                        (with-components-lock
+                          (setf subscribers (remove callback subscribers)))))
 
                      (:mount ()
                       (unless mounted
@@ -167,6 +296,23 @@
   "Notify all subscribers of state change."
   (dolist (callback subscribers)
     (funcall callback component)))
+
+(defun %notify-or-defer (component subscribers)
+  "Deliver a subscriber notification now, or — when called inside a
+   WITH-COMPONENTS-LOCK frame — defer it to that frame's post-release flush,
+   so NOTIFY-SUBSCRIBERS never fires while *COMPONENTS-LOCK* is held.
+   SUBSCRIBERS must already be a caller-owned snapshot."
+  (if *deferred-notifications*
+      (push (cons component subscribers) (car *deferred-notifications*))
+      (notify-subscribers component subscribers)))
+
+(defun %flush-deferred-notifications ()
+  "Deliver and clear the notifications queued in the current frame's holder.
+   Called by the outermost WITH-COMPONENTS-LOCK after the lock is released."
+  (let ((queued (nreverse (car *deferred-notifications*))))
+    (setf (car *deferred-notifications*) nil)
+    (dolist (entry queued)
+      (notify-subscribers (car entry) (cdr entry)))))
 
 ;;; ============================================================================
 ;;; COMPONENT STATE ACCESS MACRO

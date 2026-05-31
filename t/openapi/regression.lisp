@@ -411,3 +411,115 @@
             (errors (%validation-errors schema-source malformed)))
        (is (not (null errors))
            "Malformed spec missing info.version was unexpectedly accepted")))))
+
+;;; ============================================================================
+;;; FIXTURES — :auth + :internal annotations
+;;; ============================================================================
+
+(defhandler %fixture-secured-endpoint "/openapi-fixtures/secured"
+    (:method :get :content-type "application/json" :auth t)
+    ()
+  "{}")
+
+(defhandler %fixture-explicit-scheme-endpoint "/openapi-fixtures/explicit-scheme"
+    (:method :get :content-type "application/json" :auth ("bearerAuth"))
+    ()
+  "{}")
+
+(defhandler %fixture-internal-endpoint "/openapi-fixtures/internal"
+    (:method :get :content-type "application/json" :internal t)
+    ()
+  "{}")
+
+;;; ============================================================================
+;;; OPERATION OBJECT — SECURITY FROM HANDLER METADATA
+;;; ============================================================================
+
+(test regression-openapi-emits-security-from-handler-metadata
+  ":AUTH T on a defhandler propagates through *handler-metadata* and the
+   emitter attaches a `security` requirement listing every scheme name
+   declared on the document via :SECURITY-SCHEMES."
+  (let* ((spec (build-openapi-spec
+                :title "T" :version "1.0.0"
+                :only-paths '("/openapi-fixtures/secured")
+                :security-schemes
+                '(("cookieAuth"
+                   ("type" . "apiKey")
+                   ("in" . "cookie")
+                   ("name" . "session")))))
+         (paths (cdr (assoc "paths" spec :test #'string=)))
+         (path (cdr (assoc "/openapi-fixtures/secured" paths :test #'string=)))
+         (op (cdr (assoc "get" path :test #'string=)))
+         (security (cdr (assoc "security" op :test #'string=))))
+    (is (not (null security)) "secured op must emit `security`")
+    (is (= 1 (length security)))
+    (is (equal '((("cookieAuth"))) security)
+        "security should list cookieAuth with empty scope list")))
+
+(test regression-openapi-emits-explicit-scheme-list-from-auth
+  ":AUTH (\"bearerAuth\") on a defhandler emits exactly that requirement —
+   the list value bypasses the default-all-schemes expansion."
+  (let* ((spec (build-openapi-spec
+                :title "T" :version "1.0.0"
+                :only-paths '("/openapi-fixtures/explicit-scheme")
+                :security-schemes
+                '(("cookieAuth" ("type" . "apiKey"))
+                  ("bearerAuth" ("type" . "http") ("scheme" . "bearer")))))
+         (paths (cdr (assoc "paths" spec :test #'string=)))
+         (path (cdr (assoc "/openapi-fixtures/explicit-scheme" paths
+                            :test #'string=)))
+         (op (cdr (assoc "get" path :test #'string=)))
+         (security (cdr (assoc "security" op :test #'string=))))
+    (is (equal '((("bearerAuth"))) security)
+        "explicit-scheme op must reference bearerAuth only, not cookieAuth")))
+
+(test regression-openapi-emits-components-security-schemes
+  "When :SECURITY-SCHEMES is supplied, the document grows a
+   components.securitySchemes mapping populated from that alist."
+  (let* ((spec (build-openapi-spec
+                :title "T" :version "1.0.0"
+                :only-paths '("/openapi-fixtures/secured")
+                :security-schemes
+                '(("cookieAuth"
+                   ("type" . "apiKey")
+                   ("in" . "cookie")
+                   ("name" . "session")))))
+         (components (cdr (assoc "components" spec :test #'string=)))
+         (schemes (cdr (assoc "securitySchemes" components :test #'string=))))
+    (is (not (null schemes)))
+    (is (not (null (assoc "cookieAuth" schemes :test #'string=)))
+        "cookieAuth scheme must appear under components.securitySchemes")))
+
+(test regression-openapi-omits-components-when-no-security-schemes
+  "Default emission (no :SECURITY-SCHEMES) emits no `components` and no
+   per-op `security`, preserving the v0 surface for callers that have
+   not opted in."
+  (let* ((spec (build-openapi-spec
+                :title "T" :version "1.0.0"
+                :only-paths '("/openapi-fixtures/secured")))
+         (paths (cdr (assoc "paths" spec :test #'string=)))
+         (path (cdr (assoc "/openapi-fixtures/secured" paths :test #'string=)))
+         (op (cdr (assoc "get" path :test #'string=))))
+    (is (null (assoc "components" spec :test #'string=))
+        "components must be absent when no security-schemes supplied")
+    (is (null (assoc "security" op :test #'string=))
+        "operation security must be absent when no schemes to reference")))
+
+;;; ============================================================================
+;;; PATHS — :INTERNAL EXCLUSION
+;;; ============================================================================
+
+(test regression-openapi-excludes-internal-routes
+  "A handler whose :OPTIONS carries :INTERNAL T drops out of the emitted
+   paths object even when explicitly listed in :ONLY-PATHS. The filter
+   is unconditional — :internal is a publish-time decision, not a
+   request-time gate."
+  (let* ((spec (build-openapi-spec
+                :title "T" :version "1.0.0"
+                :only-paths '("/openapi-fixtures/internal"
+                              "/openapi-fixtures/secured")))
+         (paths (cdr (assoc "paths" spec :test #'string=))))
+    (is (null (assoc "/openapi-fixtures/internal" paths :test #'string=))
+        "internal route must NOT appear in emitted paths")
+    (is (not (null (assoc "/openapi-fixtures/secured" paths :test #'string=)))
+        "non-internal route must still appear when listed")))

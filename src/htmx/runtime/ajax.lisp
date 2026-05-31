@@ -107,6 +107,19 @@
                                                (let ((token (ps:chain csrf-meta (get-attribute "content"))))
                                                  (when token
                                                    (ps:chain fd (append "csrf-token" token)))))))
+                                         (when fd
+                                           (let ((has-file false))
+                                             (ps:chain fd (for-each
+                                               (lambda (v)
+                                                 (when (or (ps:instanceof v -File)
+                                                           (ps:instanceof v -Blob))
+                                                   (setf has-file true)))))
+                                             (unless has-file
+                                               (let ((params (ps:new (-U-R-L-Search-Params))))
+                                                 (ps:chain fd (for-each
+                                                   (lambda (v k)
+                                                     (ps:chain params (append k v)))))
+                                                 (setf fd params)))))
                                          fd)))
                                ;; hx-sync support: parse "this:replace" or "this:drop" etc.
                                (sync-attr (ps:chain element (get-attribute "hx-sync")))

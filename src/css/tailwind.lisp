@@ -87,12 +87,37 @@
    PREFIX: Tailwind prefix
    VALUE: Literal CSS value
 
+   Strips characters that could break out of the `prefix-[value]`
+   arbitrary-value syntax, the surrounding double-quoted `class` attribute,
+   or an unquoted attribute sink: whitespace, `]`, quotes, angle brackets,
+   plus `{ } ; = \\` and backtick. The first set is load-bearing in the
+   current double-quoted sink; the second is defense-in-depth so the same
+   token is also inert if a future caller emits it into an unquoted
+   attribute (where space/`=`/backtick would otherwise start a new
+   attribute). Legitimate CSS-value characters — parens, commas, `#`, `%`,
+   `.` — survive.
+
    Examples:
    (tw-arbitrary \"bg\" \"#FF0000\")    ; => \"bg-[#FF0000]\"
    (tw-arbitrary \"w\" \"clamp(1rem, 5vw, 3rem)\") ; => \"w-[clamp(1rem,5vw,3rem)]\""
   (format nil "~A-[~A]" prefix
-          ;; Remove spaces for Tailwind's arbitrary value syntax
-          (remove #\Space value)))
+          (remove-if (lambda (c)
+                       (or (char= c #\Space)
+                           (char= c #\])
+                           (char= c #\")
+                           (char= c #\')
+                           (char= c #\<)
+                           (char= c #\>)
+                           (char= c #\{)
+                           (char= c #\})
+                           (char= c #\;)
+                           (char= c #\=)
+                           (char= c #\\)
+                           (char= c #\`)
+                           (char= c #\Newline)
+                           (char= c #\Return)
+                           (char= c #\Tab)))
+                     value)))
 
 (defun tw-bg-value (key)
   "Generate background class with token value.
@@ -113,16 +138,58 @@
 ;;; Tailwind Configuration Generation (Parenscript)
 ;;; ─────────────────────────────────────────────────────────────────────────────
 
+(defparameter *tailwind-config-max-tokens* 256
+  "Cap on the number of color tokens TAILWIND-CONFIG will emit.
+   A caller-controlled COLORS alist longer than this is refused at
+   the boundary, bounding the work the parenscript emitter performs
+   and the size of the resulting JS literal sent to the client.")
+
+(define-condition tailwind-config-token-invalid (error)
+  ((key :initarg :key :reader tailwind-config-token-invalid-key))
+  (:report
+   (lambda (c stream)
+     (format stream "TAILWIND-CONFIG color token key ~S is not a keyword; ~
+                     pass an alist of (keyword . string) pairs."
+             (tailwind-config-token-invalid-key c))))
+  (:documentation
+   "Signalled when TAILWIND-CONFIG sees a color-token key that is not a
+    keyword. Refusing coercion at this boundary keeps the keyword pool
+    bounded by the application's declared color tokens."))
+
+(define-condition tailwind-config-too-many-tokens (error)
+  ((count :initarg :count :reader tailwind-config-too-many-tokens-count)
+   (limit :initarg :limit :reader tailwind-config-too-many-tokens-limit))
+  (:report
+   (lambda (c stream)
+     (format stream "TAILWIND-CONFIG received ~D color tokens; cap is ~D."
+             (tailwind-config-too-many-tokens-count c)
+             (tailwind-config-too-many-tokens-limit c)))))
+
 (defun tailwind-config (&key (colors *colors*) (typography *typography*))
   "Generate Tailwind CDN configuration script via Parenscript.
    Extends Tailwind's theme with current design tokens.
-   NO hardcoded values - all from token system."
-  (let ((color-pairs (mapcan (lambda (pair)
-                               (list (alexandria:make-keyword
-                                      (string-downcase (symbol-name (car pair))))
-                                     (cdr pair)))
-                             colors))
-        ;; Extract font family from typography tokens (required)
+   NO hardcoded values - all from token system.
+
+   COLORS keys must be keywords — TAILWIND-CONFIG no longer interns
+   downcased variants, so the keyword pool stays bounded by what the
+   application declared in *COLORS* (or whatever alist the caller
+   supplies). A non-keyword key signals TAILWIND-CONFIG-TOKEN-INVALID;
+   a COLORS alist longer than *TAILWIND-CONFIG-MAX-TOKENS* signals
+   TAILWIND-CONFIG-TOO-MANY-TOKENS."
+  (when (> (length colors) *tailwind-config-max-tokens*)
+    (error 'tailwind-config-too-many-tokens
+           :count (length colors)
+           :limit *tailwind-config-max-tokens*))
+  (let ((color-pairs
+          (mapcan (lambda (pair)
+                    (let ((key (car pair)))
+                      (unless (keywordp key)
+                        (error 'tailwind-config-token-invalid :key key))
+                      (let ((name (string-downcase (symbol-name key))))
+                        (unless (safe-css-ident-p name)
+                          (error 'unsafe-css-ident :ident name)))
+                      (list key (cdr pair))))
+                  colors))
         (font-family (or (cdr (assoc :family typography))
                          (error "Typography token :family is required. Set *typography* before calling tailwind-config."))))
     (parenscript:ps*

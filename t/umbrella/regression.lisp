@@ -49,15 +49,16 @@
 (test regression-umbrella-facades-every-sub-system
   "Every external symbol of every :lol-web/<n> sub-system is also external
    in the umbrella :lol-web (resolving to the same symbol object). Catches
-   the drift where a new sub-system ships without an umbrella refresh —
-   the failure mode that left :lol-web/extractors, :lol-web/jschema, and
-   :lol-web/openapi unfacaded across Phases 7.2 / 7.5(b)' / 7.5(b)."
-  (let ((sub-systems '(:lol-web/sanitize :lol-web/core :lol-web/css
-                       :lol-web/html :lol-web/parenscript
+   the drift where a new sub-system ships without an umbrella refresh."
+  ;; :lol-web/devtools is intentionally excluded — devtools is an opt-in
+  ;; consumer add-on, not part of the umbrella surface. Loading :lol-web
+  ;; standalone must not pull in the surgery RCE surface.
+  (let ((sub-systems '(:lol-web/escape :lol-web/crypto :lol-web/core
+                       :lol-web/css :lol-web/html :lol-web/parenscript
                        :lol-web/server :lol-web/extractors :lol-web/jschema
                        :lol-web/openapi :lol-web/htmx :lol-web/realtime
                        :lol-web/realtime-htmx :lol-web/wizards
-                       :lol-web/devtools :lol-web/fullstack
+                       :lol-web/fullstack
                        :lol-web/optimization :lol-web/forms
                        :lol-web/rendering :lol-web/resources
                        :lol-web/client-runtime))
@@ -83,3 +84,25 @@
         (loop for k being the hash-keys of missing-by-sub
               for v = (gethash k missing-by-sub)
               collect k collect v))))
+
+(test regression-umbrella-does-not-use-devtools
+  "The :lol-web umbrella must not :use :lol-web/devtools. Consumers loading
+   the umbrella must not inherit the surgery RCE surface; devtools is an
+   explicit opt-in via (asdf:load-system :lol-web/devtools)."
+  (let ((umbrella-uses (package-use-list (find-package :lol-web)))
+        (devtools-pkg (find-package :lol-web/devtools)))
+    (is (not (find devtools-pkg umbrella-uses))
+        ":lol-web must not have :lol-web/devtools in its :use list")))
+
+(test regression-umbrella-exports-no-surgery-symbols
+  "The :lol-web umbrella must not export any surgery-* symbols. Even if
+   devtools is loaded later in the image, the umbrella surface is fixed
+   at defpackage time and must not re-export the opt-in subsystem."
+  (let ((leaked '()))
+    (do-external-symbols (sym (find-package :lol-web))
+      (let ((name (symbol-name sym)))
+        (when (or (search "SURGERY" name)
+                  (search "XRAY-WRAPPER" name))
+          (push sym leaked))))
+    (is (null leaked)
+        ":lol-web must not export surgery-* symbols; leaked: ~A" leaked)))

@@ -70,10 +70,119 @@
         nil)))
 
 ;;; ============================================================================
+;;; NEUTRAL RESPONSE SHAPES
+;;;
+;;; "Component not found" and "Forbidden" used to be distinguishable on
+;;; the wire, which let a probe enumerate component IDs by status string.
+;;; Both authz refusal and existence refusal now collapse to the same
+;;; opaque "Not available" shape. Caller-bug refusals (bad action name,
+;;; malformed args) keep distinct error strings — those leak nothing
+;;; about the registry.
+;;; ============================================================================
+
+(defun %component-unavailable-response ()
+  "Neutral response for both 'component not found' and 'principal not
+   authorised'. Identical bytes for both arms denies the oracle."
+  '((:success . nil) (:error . "Not available")))
+
+(defun %component-unavailable-json ()
+  "Encoded form of the neutral unavailable response."
+  (encode-json-string (%component-unavailable-response)))
+
+(defun %invalid-args-response ()
+  "Caller-bug refusal: malformed :args, arity mismatch, or action
+   handler crash. Separate from %component-unavailable so genuine
+   misuse is distinguishable from authz/oracle gates."
+  '((:success . nil) (:error . "Invalid arguments")))
+
+;;; ============================================================================
+;;; ACTION ARITY REGISTRY
+;;;
+;;; The /api/dispatch handler accepts a free-form :args list from the
+;;; client; without a known arity it cannot reject an arity mismatch
+;;; before applying. defcomponent-with-api registers the expected arity
+;;; for each (component-name . action-keyword) pair at expansion so the
+;;; dispatcher can refuse the bad shape ahead of APPLY.
+;;; ============================================================================
+
+(defparameter *action-arities* (make-hash-table :test 'equal)
+  "Hash from (COMPONENT-NAME-SYMBOL . ACTION-KEYWORD) to integer arity.
+   Populated at defcomponent-with-api expansion; consulted by the
+   /api/dispatch handler to refuse arity mismatches before APPLY runs.")
+
+(defun register-action-arity (component-name action-key arity)
+  "Record ARITY for the (COMPONENT-NAME . ACTION-KEY) pair. Subsequent
+   redefinitions overwrite (REPL reload of a defcomponent-with-api form
+   updates the entry in place)."
+  (setf (gethash (cons component-name action-key) *action-arities*) arity))
+
+(defun action-arity (component-name action-key)
+  "Return the recorded arity for (COMPONENT-NAME . ACTION-KEY), or NIL
+   when no entry exists."
+  (gethash (cons component-name action-key) *action-arities*))
+
+;;; ============================================================================
+;;; AUTHORIZATION HELPER
+;;; ============================================================================
+
+(defun %principal-owns-component-p (component-id)
+  "Verify the current request's principal owns COMPONENT-ID. Returns T
+   when the component has no principal-binding (public instance) or
+   when the binding is EQUAL to (current-principal). Consumer chooses
+   binding shape; opaque to the framework."
+  (let ((binding (component-principal-binding component-id)))
+    (or (null binding)
+        (equal binding (lol-web/server:current-principal)))))
+
+(defmacro %with-component-auth ((component-id) &body body)
+  "Wrap BODY in with-auth and refuse with the neutral unavailable
+   shape when the resolved principal does not own COMPONENT-ID. The
+   auth gate runs first; an unauthenticated caller never reaches the
+   ownership check. Both 'no auth' and 'wrong principal' return bytes
+   identical to 'component not found' — the wire cannot distinguish."
+  (let ((cid (gensym "CID")))
+    `(let ((,cid ,component-id))
+       (lol-web/server:with-auth ()
+         (if (%principal-owns-component-p ,cid)
+             (progn ,@body)
+             (%component-unavailable-json))))))
+
+(defun %extract-signed-set-state (body-json)
+  "Pull the signed envelope off BODY-JSON and verify it against the
+   per-request hydration key. Returns (VALUES KEY VALUE STATUS) where
+   STATUS is :OK plus a keyword KEY and the payload VALUE, otherwise
+   STATUS is :NO-KEY / :MISSING-TAG / :BAD-TAG / :INVALID-KEY and the
+   first two values are NIL. Refuses absent envelopes and payload shapes
+   the per-component handler cannot consume."
+  (let ((secret-key (%request-hydration-key))
+        (signed (cdr (assoc :signed body-json))))
+    (multiple-value-bind (payload status)
+        (verify-hydration-state signed secret-key)
+      (case status
+        (:ok
+         (let* ((raw-key (cdr (assoc :key payload)))
+                (key (and (stringp raw-key) (safe-coerce-keyword raw-key)))
+                (value (cdr (assoc :value payload))))
+           (if key
+               (values key value :ok)
+               (values nil nil :invalid-key))))
+        (t (values nil nil status))))))
+
+(defun %set-state-refusal (status)
+  "Translate a verify-hydration-state STATUS into the JSON refusal body."
+  (encode-json-string
+    `((:success . nil)
+      (:error . ,(ecase status
+                   (:no-key "Hydration secret-key not configured")
+                   (:missing-tag "Missing or malformed signed envelope")
+                   (:bad-tag "Signed envelope failed verification")
+                   (:invalid-key "Invalid or unknown :key"))))))
+
+;;; ============================================================================
 ;;; DEFCOMPONENT-WITH-API MACRO
 ;;; ============================================================================
 
-(defmacro! defcomponent-with-api (name (&rest props) &key state actions render)
+(defmacro! defcomponent-with-api (name (&rest props) &key state actions render public)
   "Define a component with auto-generated API endpoints.
 
    NAME: Component name (becomes part of API path)
@@ -106,14 +215,19 @@
                             (cl-who:esc (getf task :text))))))))"
   (let* ((action-names (mapcar #'extract-action-name actions))
          (component-path (kebab-to-path name))
-         (routes-var (symb "*" name "-ROUTES*")))
+         (routes-var (symb "*" name "-ROUTES*"))
+         (wrap-auth (lambda (cid-form body)
+                      (if public
+                          body
+                          `(%with-component-auth (,cid-form) ,body)))))
     `(progn
-       ;; Define the component
-       (defun ,name (&key (id (generate-component-id ',name)) ,@props)
-         (let (;; Initialize state
-               ,@(mapcar (lambda (s)
-                           `(,(car s) ,(cadr s)))
-                         state))
+       ;; Define the component. principal-binding is opaque consumer data;
+       ;; NIL leaves the instance reachable by any authenticated caller,
+       ;; non-NIL gates dispatch on (equal binding (current-principal)).
+       (defun ,name (&key (id (generate-component-id ',name))
+                          principal-binding
+                          ,@props)
+         (let (,@(mapcar (lambda (s) `(,(car s) ,(cadr s))) state))
            (let ((,g!self
                   (pandoriclet ((id id)
                                 ,@(mapcar (lambda (s) `(,(car s) ,(car s))) state)
@@ -126,30 +240,42 @@
 
                       (:state (&optional key)
                        (if key
+                           ;; Accept either the bare symbol or the same-name
+                           ;; keyword so callers that route external strings
+                           ;; through SAFE-COERCE-KEYWORD hit the same slot
+                           ;; as direct Lisp callers.
                            (ecase key
-                             ,@(mapcar (lambda (s) `((,(car s)) ,(car s))) state))
+                             ,@(mapcar (lambda (s)
+                                         `((,(car s)
+                                            ,(intern (symbol-name (car s)) :keyword))
+                                           ,(car s)))
+                                       state))
                            (list ,@(mapcan (lambda (s)
                                              `(,(intern (symbol-name (car s)) :keyword)
                                                ,(car s)))
                                            state))))
 
                       (:set-state (key value)
-                       (ecase key
-                         ,@(mapcar (lambda (s)
-                                     `((,(car s)) (setf ,(car s) value)))
-                                   state))
+                       (with-components-lock
+                         (ecase key
+                           ,@(mapcar (lambda (s)
+                                       `((,(car s)
+                                          ,(intern (symbol-name (car s)) :keyword))
+                                         (setf ,(car s) value)))
+                                     state)))
                        value)
 
                       (:dispatch (action &rest args)
-                       (ecase action
-                         ,@(mapcar (lambda (act)
-                                     (let ((act-name (extract-action-name act))
-                                           (act-params (extract-action-params act))
-                                           (act-body (extract-action-body act)))
-                                       `((,act-name)
-                                         (destructuring-bind ,act-params args
-                                           ,@act-body))))
-                                   actions)))
+                       (with-components-lock
+                         (ecase action
+                           ,@(mapcar (lambda (act)
+                                       (let ((act-name (extract-action-name act))
+                                             (act-params (extract-action-params act))
+                                             (act-body (extract-action-body act)))
+                                         `((,act-name)
+                                           (destructuring-bind ,act-params args
+                                             ,@act-body))))
+                                     actions))))
 
                       (:props ()
                        (list ,@(mapcan (lambda (p)
@@ -171,34 +297,54 @@
              ;; can locate this instance. defcomponent does the equivalent in
              ;; its :mount handler — defcomponent-with-api has no :mount, so
              ;; register inline at construction time.
-             (register-component id ,g!self)
+             (register-component id ,g!self :principal-binding principal-binding)
              ,g!self)))
 
-       ;; Register API routes
+       ;; Record action arities so /api/dispatch can refuse arity
+       ;; mismatches before APPLY runs. Re-evaluating the form (REPL
+       ;; reload) overwrites the entry in place.
+       ,@(mapcar (lambda (act)
+                   (let ((act-name (extract-action-name act))
+                         (act-params (extract-action-params act)))
+                     `(register-action-arity
+                       ',name
+                       ,(intern (symbol-name act-name) :keyword)
+                       ,(length act-params))))
+                 actions)
+
+       ;; Register API routes. Each handler's body is wrapped in
+       ;; %with-component-auth unless :public T was supplied; the wrapper
+       ;; fails closed when no auth middleware is installed and rejects
+       ;; cross-owner dispatch when the component carries a binding.
        ,@(mapcar (lambda (act)
                    (let* ((act-name (extract-action-name act))
                           (act-params (extract-action-params act))
                           (api-path (generate-api-path name act-name))
-                          (handler-name (symb name '- act-name '-handler)))
+                          (handler-name (symb name '- act-name '-handler))
+                          (cid (gensym "CID")))
                      `(defhandler ,handler-name ,api-path
                           (:method :post :content-type "application/json")
                           ((body-json :json-body :required nil))
-                        (encode-json-string
-                          (let* ((component-id (cdr (assoc :component-id body-json)))
-                                 (component (find-component component-id)))
-                            (if component
-                                (let ((args (list ,@(mapcar
-                                                     (lambda (p)
-                                                       `(cdr (assoc
-                                                              ,(intern (symbol-name p) :keyword)
-                                                              body-json)))
-                                                     act-params))))
-                                  (apply component :dispatch ',act-name args)
-                                  (list :success t
-                                        :html (funcall component :render)
-                                        :state (funcall component :state)))
-                                (list :success nil
-                                      :error "Component not found")))))))
+                        (let ((,cid (cdr (assoc :component-id body-json))))
+                          ,(funcall wrap-auth cid
+                              `(let ((component (find-component ,cid)))
+                                 (if (null component)
+                                     (%component-unavailable-json)
+                                     (handler-case
+                                         (let ((args (list ,@(mapcar
+                                                              (lambda (p)
+                                                                `(cdr (assoc
+                                                                       ,(intern (symbol-name p) :keyword)
+                                                                       body-json)))
+                                                              act-params))))
+                                           (apply component :dispatch ',act-name args)
+                                           (encode-json-string
+                                             (list :success t
+                                                   :html (funcall component :render)
+                                                   :state (funcall component :state))))
+                                       (error ()
+                                         (encode-json-string
+                                           (%invalid-args-response)))))))))))
                  actions)
 
        ;; State getter route
@@ -206,42 +352,49 @@
            ,(format nil "/api/~A/get-state" component-path)
            (:method :post :content-type "application/json")
            ((body-json :json-body :required nil))
-         (encode-json-string
-           (let* ((component-id (cdr (assoc :component-id body-json)))
-                  (component (find-component component-id)))
-             (if component
-                 (list :success t :state (funcall component :state))
-                 (list :success nil :error "Component not found")))))
+         (let ((,g!cid (cdr (assoc :component-id body-json))))
+           ,(funcall wrap-auth g!cid
+               `(let ((component (find-component ,g!cid)))
+                  (if component
+                      (encode-json-string
+                        (list :success t :state (funcall component :state)))
+                      (%component-unavailable-json))))))
 
-       ;; State setter route
+       ;; State setter route. Requires an HMAC-signed envelope so a
+       ;; tampered client cannot forge (key, value) writes; the legal
+       ;; mint path is via lol-web/fullstack:sign-hydration-state.
        (defhandler ,(symb name '-set-state-handler)
            ,(format nil "/api/~A/set-state" component-path)
            (:method :post :content-type "application/json")
            ((body-json :json-body :required nil))
-         (encode-json-string
-           (let* ((component-id (cdr (assoc :component-id body-json)))
-                  (key (intern (string-upcase (cdr (assoc :key body-json))) :keyword))
-                  (value (cdr (assoc :value body-json)))
-                  (component (find-component component-id)))
-             (if component
-                 (progn
-                   (funcall component :set-state key value)
-                   (list :success t
-                         :html (funcall component :render)
-                         :state (funcall component :state)))
-                 (list :success nil :error "Component not found")))))
+         (let ((,g!cid (cdr (assoc :component-id body-json))))
+           ,(funcall wrap-auth g!cid
+               `(multiple-value-bind (key value status)
+                    (%extract-signed-set-state body-json)
+                  (if (eq status :ok)
+                      (let ((component (find-component ,g!cid)))
+                        (if component
+                            (progn
+                              (funcall component :set-state key value)
+                              (encode-json-string
+                                (list :success t
+                                      :html (funcall component :render)
+                                      :state (funcall component :state))))
+                            (%component-unavailable-json)))
+                      (%set-state-refusal status))))))
 
        ;; Render route
        (defhandler ,(symb name '-render-handler)
            ,(format nil "/api/~A/render" component-path)
            (:method :post :content-type "application/json")
            ((body-json :json-body :required nil))
-         (encode-json-string
-           (let* ((component-id (cdr (assoc :component-id body-json)))
-                  (component (find-component component-id)))
-             (if component
-                 (list :success t :html (funcall component :render))
-                 (list :success nil :error "Component not found")))))
+         (let ((,g!cid (cdr (assoc :component-id body-json))))
+           ,(funcall wrap-auth g!cid
+               `(let ((component (find-component ,g!cid)))
+                  (if component
+                      (encode-json-string
+                        (list :success t :html (funcall component :render)))
+                      (%component-unavailable-json))))))
 
        ;; Store route list for introspection
        (defparameter ,routes-var
@@ -343,44 +496,69 @@
 (defhandler component-api-dispatch-handler "/api/dispatch"
     (:method :post :content-type "application/json")
     ((body-json :json-body :required nil))
-  "Dispatch an action to a component."
-  (encode-json-string
-    (let* ((component-id (cdr (assoc :component-id body-json)))
-           (action (intern (string-upcase (cdr (assoc :action body-json))) :keyword))
-           (args (cdr (assoc :args body-json)))
-           (component (find-component component-id)))
-      (if component
-          (progn
-            (apply #'funcall component :dispatch action args)
-            `((:success . t)
-              (:html . ,(render-component component))))
-          `((:success . nil)
-            (:error . "Component not found"))))))
+  "Dispatch an action to a component. Validates :args is a list before
+   APPLY, and refuses arity mismatch when the component's action arity
+   is registered. Action handler crashes are caught and turned into a
+   neutral 'invalid arguments' response so a worker thread never dies
+   from a malformed JSON body."
+  (let ((component-id (cdr (assoc :component-id body-json))))
+    (%with-component-auth (component-id)
+      (let* ((raw-action (cdr (assoc :action body-json)))
+             (action (and (stringp raw-action) (safe-coerce-keyword raw-action)))
+             (raw-args (cdr (assoc :args body-json)))
+             (component (find-component component-id)))
+        (cond
+          ((not component) (%component-unavailable-json))
+          ((not action)
+           (encode-json-string
+             '((:success . nil) (:error . "Invalid or unknown :action"))))
+          ((not (listp raw-args))
+           (encode-json-string (%invalid-args-response)))
+          (t
+           (let* ((inspect (funcall component :inspect))
+                  (cname (getf inspect :component))
+                  (expected (and cname (action-arity cname action))))
+             (cond
+               ((and expected (/= (length raw-args) expected))
+                (encode-json-string (%invalid-args-response)))
+               (t
+                (handler-case
+                    (progn
+                      (apply #'funcall component :dispatch action raw-args)
+                      (encode-json-string
+                        `((:success . t)
+                          (:html . ,(render-component component)))))
+                  (error ()
+                    (encode-json-string (%invalid-args-response)))))))))))))
 
 (defhandler component-api-set-state-handler "/api/set-state"
     (:method :post :content-type "application/json")
     ((body-json :json-body :required nil))
-  "Set state on a component."
-  (encode-json-string
-    (let* ((component-id (cdr (assoc :component-id body-json)))
-           (key (intern (string-upcase (cdr (assoc :key body-json))) :keyword))
-           (value (cdr (assoc :value body-json)))
-           (component (find-component component-id)))
-      (if component
-          (progn
-            (funcall component :set-state key value)
-            `((:success . t)
-              (:html . ,(render-component component))))
-          `((:success . nil)
-            (:error . "Component not found"))))))
+  "Set state on a component. Requires an HMAC-signed envelope under the
+   :SIGNED key carrying (:KEY ... :VALUE ...); verification reads the
+   key configured on MAKE-APP via :HYDRATION-SECRET-KEY."
+  (let ((component-id (cdr (assoc :component-id body-json))))
+    (%with-component-auth (component-id)
+      (multiple-value-bind (key value status)
+          (%extract-signed-set-state body-json)
+        (if (eq status :ok)
+            (let ((component (find-component component-id)))
+              (if component
+                  (progn
+                    (funcall component :set-state key value)
+                    (encode-json-string
+                      `((:success . t)
+                        (:html . ,(render-component component)))))
+                  (%component-unavailable-json)))
+            (%set-state-refusal status))))))
 
 (defhandler component-api-component-state-handler "/api/component-state"
     (:method :post :content-type "application/json")
     ((body-json :json-body :required nil))
   "Get component state for inspection."
-  (encode-json-string
-    (let* ((component-id (cdr (assoc :component-id body-json)))
-           (component (find-component component-id)))
-      (if component
-          (funcall component :inspect)
-          `((:error . "Component not found"))))))
+  (let ((component-id (cdr (assoc :component-id body-json))))
+    (%with-component-auth (component-id)
+      (let ((component (find-component component-id)))
+        (if component
+            (encode-json-string (funcall component :inspect))
+            (%component-unavailable-json))))))

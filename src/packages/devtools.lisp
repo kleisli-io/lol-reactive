@@ -13,6 +13,11 @@
   (:import-from :let-over-lambda
                 :with-pandoric
                 :symb)
+  ;; surgery-update body :key goes through safe-coerce-keyword;
+  ;; the panel CSRF meta tag goes through escape-attribute.
+  (:import-from :lol-web/escape
+                #:safe-coerce-keyword
+                #:escape-attribute)
   (:export
    #:capture-snapshot
    #:restore-snapshot
@@ -21,16 +26,20 @@
    #:component-state-tree
    #:surgery-get-state
    #:surgery-set-state
-   #:surgery-eval-in-context
    #:surgery-dispatch
    #:xray-wrapper-html
    #:surgery-panel-html
    #:enable-surgery-mode
    #:disable-surgery-mode
    #:surgery-mode-p
+   #:*surgery-enable-audit-hook*
+   #:*surgery-production-env-var*
+   #:surgery-middleware
    #:surgery-runtime-js
    #:surgery-css
    #:push-undo
    #:surgery-undo
    #:surgery-redo
-   #:register-component-metadata))
+   #:register-component-metadata
+   #:public-condition-message
+   #:*public-condition-accessors*))

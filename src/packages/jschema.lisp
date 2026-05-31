@@ -33,6 +33,17 @@
    #:validate
    #:clear-registry
    #:get-schema
+   #:*registry*
+   #:call-with-registry
+   ;; Depth + cycle guards
+   #:*max-schema-depth*
+   #:*max-validation-depth*
+   #:*schema-json-max-depth*
+   #:*schema-json-max-string-length*
+   ;; Attacker-input bounds
+   #:*pattern-max-length*
+   #:*pattern-compile-timeout-seconds*
+   #:*unique-items-hash-set-threshold*
    ;; Schema object
    #:json-schema
    #:json-schema-p

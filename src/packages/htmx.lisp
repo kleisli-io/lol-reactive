@@ -10,9 +10,19 @@
         :lol-web/css       ; css-rules (used by autocomplete-css)
         :lol-web/html      ; htm-str, html-page (used by htmx/server.lisp)
         :lol-web/server)   ; add-response-header, encode-json-string, defroute
+  (:import-from :let-over-lambda
+                :defmacro!)   ; with-htmx-response gensyms via g!-prefix
+  (:import-from :lol-web/escape
+                #:safe-url-allowlist)
+  (:import-from :lol-web/parenscript
+                #:jsonify)
+  (:import-from :lol-web/crypto
+                #:mint-token
+                #:verify-token)
   (:export
    ;; runtime.lisp
    #:htmx-runtime-js
+   #:emit-hx-attrs
    #:hx-get
    #:hx-post
    #:hx-put
@@ -25,7 +35,16 @@
    ;; oob.lisp
    #:oob-swap
    #:oob-content
+   #:make-oob-swap
    #:with-oob-swaps
+   #:*oob-selector-allowlist*
+   #:*oob-selector-denylist*
+   #:*oob-signed-selector-secret*
+   #:validate-oob-selector
+   #:mint-oob-selector-token
+   #:unsafe-oob-selector
+   #:unsafe-oob-selector-selector
+   #:unsafe-oob-selector-reason
    ;; server.lisp — canonical home for htmx-* request helpers
    #:htmx-request-p
    #:htmx-boosted-p
