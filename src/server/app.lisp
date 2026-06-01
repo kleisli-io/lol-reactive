@@ -1043,9 +1043,15 @@
   (let ((env-override (uiop:getenv "STATIC_ROOT")))
     (cond
       (env-override (normalize-static-root env-override))
-      (t (normalize-static-root
-          (merge-pathnames "static/"
-                           (asdf:system-source-directory "lol-web")))))))
+      ;; ASDF anchor fails under buildLisp (no registered system) — surface a
+      ;; legible remedy instead of leaking ASDF's opaque missing-component.
+      (t (or (ignore-errors
+               (normalize-static-root
+                (merge-pathnames "static/"
+                                 (asdf:system-source-directory "lol-web"))))
+             (error "lol-web static serving is enabled but STATIC_ROOT is unset ~
+                     and lol-web is not loaded as an ASDF system. Set STATIC_ROOT ~
+                     or pass :static-root to start-server."))))))
 
 (defun %canonical-namestring (pathname)
   "Canonical namestring for PATHNAME (resolves symlinks via truename),
@@ -1096,7 +1102,7 @@
         (t (funcall inner-static-app env))))))
 
 (defun start-server (&key (port 8080) debug
-                          (static-path "/static/") (static-root (default-static-root))
+                          (static-path "/static/") (static-root nil)
                           (use-session t) (use-csrf t) (use-accesslog t) (use-static t)
                           (use-cors nil)
                           (cors-origin nil)
@@ -1150,6 +1156,10 @@
   (mapc #'funcall *before-server-start-hook*)
   (when debug
     (enable-debug-mode))
+  ;; Resolve static-root only when static serving is on — asset-only servers
+  ;; (use-static nil) skip the ASDF system lookup entirely.
+  (when (and use-static (null static-root))
+    (setf static-root (default-static-root)))
   (setf *lack-app* (make-app :static-path static-path
                              :static-root static-root
                              :use-session use-session
