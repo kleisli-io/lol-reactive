@@ -631,7 +631,9 @@
         (push (cons :static
                     (lambda (app)
                       (%static-ancestry-wrapper
-                       (funcall static-mw app :path static-path :root static-root)
+                       (%static-cache-wrapper
+                        (funcall static-mw app :path static-path :root static-root)
+                        static-path static-root)
                        static-path static-root)))
               mw-table)))
     ;; Content-addressed external assets (register-asset / lol-web:page).
@@ -1065,13 +1067,15 @@
   (and (>= (length path) (length prefix))
        (string= path prefix :end1 (length prefix))))
 
-(defun %static-request-under-root-p (request-path static-path static-root)
-  "True iff the file resolved from REQUEST-PATH (a URL path) under
-   STATIC-ROOT is a descendant of STATIC-ROOT after symlink resolution.
+(defun %static-candidate-namestring (request-path static-path static-root)
+  "Canonical namestring of the existing file REQUEST-PATH (a URL path)
+   resolves to under STATIC-ROOT, or NIL when the prefix does not match,
+   the file does not exist, or the resolved file escapes STATIC-ROOT after
+   symlink resolution.
 
    Defends against `..` segments and symlink escape: even if the static
-   middleware's join logic is lax, the truename of the candidate must
-   sit under truename of the root."
+   middleware's join logic is lax, the truename of the candidate must sit
+   under truename of the root."
   (when (%path-has-prefix-p request-path static-path)
     (let* ((suffix (subseq request-path (length static-path)))
            ;; Defang absolute-suffix forms (`/static//etc/passwd`) by
@@ -1081,8 +1085,14 @@
            (candidate (merge-pathnames suffix static-root))
            (root-canon (%canonical-namestring static-root))
            (cand-canon (%canonical-namestring candidate)))
-      (and root-canon cand-canon
-           (%path-has-prefix-p cand-canon root-canon)))))
+      (when (and root-canon cand-canon
+                 (%path-has-prefix-p cand-canon root-canon))
+        cand-canon))))
+
+(defun %static-request-under-root-p (request-path static-path static-root)
+  "True iff the file resolved from REQUEST-PATH (a URL path) under
+   STATIC-ROOT is a descendant of STATIC-ROOT after symlink resolution."
+  (and (%static-candidate-namestring request-path static-path static-root) t))
 
 (defun %static-ancestry-wrapper (inner-static-app static-path static-root)
   "Wrap INNER-STATIC-APP (Lack `:static` middleware output) with an
@@ -1100,6 +1110,89 @@
                '(:content-type "text/plain; charset=utf-8")
                '("Not Found")))
         (t (funcall inner-static-app env))))))
+
+;;; Static revalidation caching. Lack's :static tier emits no Cache-Control,
+;;; and under Nix mtime is epoch-normalised so Last-Modified is a useless
+;;; validator — browsers then heuristic-cache fixed-URL assets for years. Emit
+;;; a content ETag + Cache-Control: no-cache so they revalidate via cheap 304s.
+
+(defvar *static-etag-cache* (make-hash-table :test 'equal)
+  "Memo of static-file content ETags keyed by canonical namestring. Value is
+   (write-date length . etag). A store path is immutable for the life of the
+   process, so the digest is computed at most once per file; the write-date +
+   length guard recomputes it when a mutable local static/ tree changes a
+   file in place.")
+
+(defvar *static-etag-lock* (bordeaux-threads:make-lock "lol-web-static-etag")
+  "Guards *STATIC-ETAG-CACHE*.")
+
+(defun %read-file-octets (pathname)
+  "Whole-file octet vector for PATHNAME."
+  (with-open-file (s pathname :element-type '(unsigned-byte 8))
+    (let ((buf (make-array (file-length s) :element-type '(unsigned-byte 8))))
+      (read-sequence buf s)
+      buf)))
+
+(defun %static-file-etag (namestring)
+  "Strong, quoted content ETag for the existing file NAMESTRING, or NIL when
+   it cannot be read. Memoised on (write-date, length) so a request does not
+   re-hash an unchanged file."
+  (handler-case
+      (let ((wd (file-write-date namestring))
+            (len (with-open-file (s namestring :element-type '(unsigned-byte 8))
+                   (file-length s))))
+        (bordeaux-threads:with-lock-held (*static-etag-lock*)
+          (let ((hit (gethash namestring *static-etag-cache*)))
+            (if (and hit (eql (first hit) wd) (eql (second hit) len))
+                (cddr hit)
+                (let ((etag (format nil "\"~A\""
+                                    (sha256-hex (%read-file-octets namestring)))))
+                  (setf (gethash namestring *static-etag-cache*)
+                        (list* wd len etag))
+                  etag)))))
+    (file-error () nil)))
+
+(defun %if-none-match-selects-p (if-none-match etag)
+  "True when the raw If-None-Match header IF-NONE-MATCH selects ETAG: a
+   literal `*`, or a comma-list of entity-tags containing ETAG. The browser
+   echoes the exact tag we sent, so a substring test over the trimmed header
+   covers both the single-tag and the list forms."
+  (and (stringp if-none-match)
+       (let ((v (string-trim '(#\Space #\Tab) if-none-match)))
+         (or (string= v "*")
+             (and (plusp (length etag)) (search etag v) t)))))
+
+(defun %static-add-cache-headers (response etag)
+  "RESPONSE (a Clack (status headers body) triple) with ETAG + a revalidate
+   directive spliced into its header plist."
+  (destructuring-bind (status headers body) response
+    (list status
+          (append headers (list :etag etag :cache-control "no-cache"))
+          body)))
+
+(defun %static-cache-wrapper (inner static-path static-root)
+  "Wrap INNER (Lack :static middleware output) so a served static file carries
+   a content ETag + Cache-Control: no-cache, and a conditional GET whose
+   If-None-Match matches gets a bodiless 304. Non-200s and non-static paths
+   pass through untouched."
+  (lambda (env)
+    (let* ((path-info (getf env :path-info))
+           (response (funcall inner env)))
+      (if (and (consp response)
+               (eql (first response) 200)
+               (stringp path-info)
+               (member (getf env :request-method) '(:get :head)))
+          (let* ((file (%static-candidate-namestring path-info static-path static-root))
+                 (etag (and file (%static-file-etag file))))
+            (cond
+              ((null etag) response)
+              ((let ((headers (getf env :headers)))
+                 (and headers
+                      (%if-none-match-selects-p (gethash "if-none-match" headers)
+                                                etag)))
+               (list 304 (list :etag etag :cache-control "no-cache") nil))
+              (t (%static-add-cache-headers response etag))))
+          response))))
 
 (defun start-server (&key (port 8080) debug
                           (static-path "/static/") (static-root nil)

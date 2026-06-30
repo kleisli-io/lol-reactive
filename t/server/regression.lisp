@@ -3086,3 +3086,96 @@
                                          '("https://x.example:443"))
       "and the reverse: a bare Origin matches an allowlist entry written ~
        with the explicit default port"))
+
+;;; ============================================================================
+;;; Static serving — revalidation caching (ETag + Cache-Control).
+;;; make-app's static tier must emit a content ETag + Cache-Control: no-cache
+;;; and answer a matching If-None-Match with a bodiless 304, so epoch-mtime
+;;; assets revalidate instead of being heuristic-cached stale.
+
+(defmacro with-temp-static-root ((root-var) &body body)
+  "Bind ROOT-VAR to a freshly created, empty static-root directory; remove the
+   tree afterwards."
+  `(let ((,root-var (ensure-directories-exist
+                     (merge-pathnames "lol-web-static-cache-test/"
+                                      (uiop:temporary-directory)))))
+     (uiop:delete-directory-tree ,root-var :validate t :if-does-not-exist :ignore)
+     (ensure-directories-exist ,root-var)
+     (unwind-protect (progn ,@body)
+       (uiop:delete-directory-tree ,root-var :validate t :if-does-not-exist :ignore))))
+
+(defun %write-static-file (root name content)
+  "Write CONTENT into ROOT/NAME and return the pathname."
+  (let ((path (merge-pathnames name root)))
+    (with-open-file (s path :direction :output
+                            :if-exists :supersede :if-does-not-exist :create)
+      (write-string content s))
+    path))
+
+(defun %static-get (app path &optional if-none-match)
+  "Drive APP with a synthetic GET on PATH (optionally carrying an
+   If-None-Match header) and return the raw Clack (status headers body)."
+  (funcall app
+           (list :request-method :get
+                 :path-info path
+                 :headers (let ((h (make-hash-table :test 'equal)))
+                            (when if-none-match
+                              (setf (gethash "if-none-match" h) if-none-match))
+                            h))))
+
+(defun %static-test-app (root)
+  (lol-web/server:make-app :static-root root :static-path "/static/"
+                           :use-session nil :use-csrf nil :use-accesslog nil))
+
+(test regression-static-serves-etag-and-revalidate-directive
+  "A served static file carries Cache-Control: no-cache and a strong content
+   ETag — the directive that defeats the epoch-mtime heuristic-cache trap."
+  (with-temp-static-root (root)
+    (%write-static-file root "probe.txt" "hello world")
+    (let* ((res (%static-get (%static-test-app root) "/static/probe.txt"))
+           (headers (second res)))
+      (is (= 200 (first res)) "static GET must be 200, got ~D" (first res))
+      (is (equal "no-cache" (getf headers :cache-control))
+          "Cache-Control must be no-cache, got ~S" (getf headers :cache-control))
+      (let ((etag (getf headers :etag)))
+        (is (stringp etag) "response must carry an ETag")
+        (is (and (plusp (length etag))
+                 (char= #\" (char etag 0))
+                 (char= #\" (char etag (1- (length etag)))))
+            "ETag must be a quoted strong validator, got ~S" etag)))))
+
+(test regression-static-if-none-match-returns-304
+  "A conditional GET whose If-None-Match matches the current ETag gets a
+   bodiless 304; a stale tag still gets the full 200."
+  (with-temp-static-root (root)
+    (%write-static-file root "probe.txt" "hello world")
+    (let* ((app (%static-test-app root))
+           (etag (getf (second (%static-get app "/static/probe.txt")) :etag))
+           (matched (%static-get app "/static/probe.txt" etag))
+           (stale (%static-get app "/static/probe.txt" "\"deadbeef\"")))
+      (is (= 304 (first matched))
+          "If-None-Match on the live ETag must 304, got ~D" (first matched))
+      (is (null (third matched)) "a 304 must carry no body")
+      (is (equal "no-cache" (getf (second matched) :cache-control))
+          "the 304 must still carry the revalidate directive")
+      (is (= 200 (first stale))
+          "a non-matching If-None-Match must serve the full 200, got ~D"
+          (first stale)))))
+
+(test regression-static-etag-tracks-content
+  "The ETag is content-derived: editing the file at the same URL changes the
+   tag, so a client revalidating with the old tag is handed the new bytes
+   (200) rather than a spurious 304. This is the property the epoch mtime
+   silently breaks."
+  (with-temp-static-root (root)
+    (%write-static-file root "probe.txt" "alpha")
+    (let* ((app (%static-test-app root))
+           (e1 (getf (second (%static-get app "/static/probe.txt")) :etag)))
+      (%write-static-file root "probe.txt" "beta-different-length")
+      (let* ((res (%static-get app "/static/probe.txt" e1))
+             (e2 (getf (second res) :etag)))
+        (is (= 200 (first res))
+            "the old ETag must no longer match after a content change, got ~D"
+            (first res))
+        (is (not (equal e1 e2))
+            "a content change must produce a different ETag (~S vs ~S)" e1 e2)))))
