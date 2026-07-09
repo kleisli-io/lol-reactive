@@ -175,6 +175,48 @@
             do (is (stringp k)
                    "~A produced non-string key ~S" helper k)))))
 
+(test regression-htmx-runtime-parenscript-concurrent-generation
+  "Concurrent runtime generation can create fresh Parenscript identifiers."
+  (let* ((thread-count 16)
+         (iterations 80)
+         (run-prefix (symbol-name (gensym "LOL-WEB-HTMX-CONCURRENT-")))
+         (symbols
+           (loop for thread-index below thread-count
+                 collect
+                 (loop for i below iterations
+                       collect
+                       (make-symbol
+                        (format nil "~A-~D-~D" run-prefix thread-index i)))))
+         (errors nil)
+         (errors-lock
+           (bordeaux-threads:make-lock "htmx parenscript errors"))
+         (threads
+           (loop for thread-index below thread-count
+                 for thread-symbols in symbols
+                 collect
+                 (let ((thread-index thread-index)
+                       (thread-symbols thread-symbols))
+                   (bordeaux-threads:make-thread
+                    (lambda ()
+                      (handler-case
+                          (loop for identifier in thread-symbols
+                                for i below iterations
+                                do (progn
+                                     (htmx-runtime-js)
+                                     (parenscript:ps*
+                                      `(let ((,identifier ,i))
+                                         ,identifier))))
+                        (error (e)
+                          (bordeaux-threads:with-lock-held (errors-lock)
+                            (push (princ-to-string e) errors)))))
+                    :name (format nil "htmx-parenscript-~D"
+                                  thread-index))))))
+    (dolist (thread threads)
+      (bordeaux-threads:join-thread thread))
+    (is (null errors)
+        "Concurrent Parenscript generation signaled: ~S"
+        errors)))
+
 ;;; ============================================================================
 ;;; htmx-indicator-css — keyword-as-property bug
 ;;; ============================================================================
@@ -697,4 +739,3 @@
         "the single-quoted attribute value is preserved verbatim")
     (is (search "data-x='a>b' hx-swap-oob=\"true\">" result)
         "hx-swap-oob is injected at the real tag end, right after the attribute")))
-

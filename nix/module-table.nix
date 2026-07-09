@@ -233,7 +233,7 @@
       ];
       internal-deps = [ "escape" "crypto" "css" "html" "server" "parenscript" ];
       external-deps = [ "iterate" "parenscript" "cl-ppcre" "cl-who" "babel" ];
-      test-external-deps = [ "lack-test" ];
+      test-external-deps = [ "lack-test" "bordeaux-threads" ];
       test-srcs = [
         "t/htmx/package.lisp"
         "t/htmx/suite.lisp"
